@@ -8,7 +8,7 @@ import re
 import sys
 
 from ogun_core import autotune
-from ogun_core.config import MODEL_NAME, OLLAMA_HOST, PLUGIN_BUILDER_PROMPT
+from ogun_core.config import BUILD_MAX_ATTEMPTS, MODEL_NAME, OLLAMA_HOST, PLUGIN_BUILDER_PROMPT
 from ogun_core.config import set_vram_profile
 from ogun_core.engine import CoreEngine, OllamaClient, handle_vram_command, unload_model
 from ogun_core.paths import init_user_workspace
@@ -100,6 +100,7 @@ def main() -> None:
             engine=engine,
             plugin_manager=plugin_manager,
             request_text=args.build_plugin,
+            max_attempts=BUILD_MAX_ATTEMPTS,
         )
         if success:
             print(msg)

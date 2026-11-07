@@ -214,6 +214,10 @@ def get_request_timeout() -> float:
 
 REQUEST_TIMEOUT = 300.0
 
+# Tool builds (workspace tools and plugin updates): 0 = no attempt limit. They research and retry until they pass;
+# press Ctrl+C to stop one. Set OGUN_BUILD_MAX_ATTEMPTS to a number to cap them again.
+BUILD_MAX_ATTEMPTS = int(os.environ.get("OGUN_BUILD_MAX_ATTEMPTS", "0") or 0)
+
 # System instructions
 SYSTEM_PROMPT = """You are Ogun, an autonomous technical coding engine and developer assistant.
 You specialize in writing clean, reliable, and production-ready Python code, inspecting directories,
@@ -265,6 +269,8 @@ Your response MUST contain EXACTLY TWO fenced ```python code blocks in this orde
 - Verify execution on typical inputs, empty strings (if applicable), and edge cases.
 - Compute every expected value inside the test with real code (e.g. call the same standard-library function, such as zlib.crc32 or hashlib, on the test's own input file). NEVER hand-calculate checksums, hashes, means or other numbers as constants: a guessed constant fails a correct plugin.
 - Print "PASS" and exit with code 0 on success, or print error to stderr and exit with non-zero code on failure.
+- Check EVERY example value the request quotes (valid ones and the invalid ones it says must fail), each with its own assertion.
+- Every assertion message must name the input and the actual result, e.g. `f"execute(value={v!r}): expected error, got {res.status} {res.output!r}"`. A bare "Expected error" does not say which input failed.
 
 ### Template Skeleton:
 

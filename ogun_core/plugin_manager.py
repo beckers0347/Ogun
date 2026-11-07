@@ -462,6 +462,7 @@ class PluginManager:
                 shutil.copy2(str(tool_file), str(quarantine_tool))
                 tool_file.unlink()
                 if test_file.exists():
+                    shutil.copy2(str(test_file), str(self.quarantine_dir / test_file.name))
                     test_file.unlink()
             except Exception:
                 pass

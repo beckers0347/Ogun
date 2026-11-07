@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Any, NamedTuple, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, NamedTuple, Dict, List, Optional, Set, Tuple
 
 
 _FLAG_PATTERN = re.compile(r"--([a-zA-Z0-9_\-]+)")
@@ -62,6 +62,43 @@ def extract_requested_flags(request_text: str) -> Set[str]:
     return flags
 
 
+_ENUM_RE = re.compile(r"\(([a-z][a-z_-]{2,}(?:\s*,\s*[a-z][a-z_-]{2,})+,?\s+(?:or|and)\s+[a-z][a-z_-]{2,})\)")
+
+
+def requested_output_values(request: str) -> List[str]:
+    """Exact output words a request lists in parentheses, e.g. "(object, array, string, number, boolean or null)".
+    Live bug: keypaths printed Python's names (bool, NoneType, int) instead of the requested ones, and its own tests
+    expected the same wrong names, so nothing caught it."""
+    words: List[str] = []
+    for group in _ENUM_RE.findall((request or "").lower()):
+        for w in re.split(r"\s*,\s*|\s+(?:or|and)\s+", group):
+            w = w.strip(" ,")
+            if w and w not in words:
+                words.append(w)
+    return words
+
+
+_PY_TYPE_TO_JSON = {"dict": "object", "list": "array", "str": "string", "int": "number", "float": "number",
+                    "bool": "boolean", "NoneType": "null"}
+
+
+def map_python_type_names(test_code: str, request: str) -> str:
+    """When the request lists exact output words that are JSON type names, replace Python type names inside the test
+    file's string literals with them (dict->object, list->array, str->string, int/float->number, bool->boolean,
+    NoneType->null). Live: keypaths tests kept expecting 'config.dict' for seven attempts although the request said
+    "(object, array, string, number, boolean or null)" and arbitration blamed the tests every time."""
+    vals = requested_output_values(request)
+    targets = {py: js for py, js in _PY_TYPE_TO_JSON.items() if js in vals and py.lower() not in vals}
+    if not test_code or len(targets) < 3:
+        return test_code
+    word = re.compile(r"\b(" + "|".join(sorted(targets, key=len, reverse=True)) + r")\b")
+
+    def fix_literal(m: "re.Match[str]") -> str:
+        return word.sub(lambda w: targets[w.group(1)], m.group(0))
+
+    return re.sub(r"""(?<![A-Za-z_])(['"])(?:(?!\1).)*?\1""", fix_literal, test_code)
+
+
 def check_requirements_coverage(request_text: str, code: str) -> Tuple[bool, List[str]]:
     """Verify that requested command-line flags and core features appear in generated code.
 
@@ -79,6 +116,18 @@ def check_requirements_coverage(request_text: str, code: str) -> Tuple[bool, Lis
         if flag not in code and flag_clean not in code_lower and flag_norm not in code_lower:
             missing.append(f"Missing requested flag/option: {flag}")
 
+    # Exact output words the request lists in parentheses must appear in the code as string literals.
+    _vals = requested_output_values(request_text)
+    _missing_vals = [w for w in _vals if f"'{w}'" not in code_lower and f'"{w}"' not in code_lower]
+    # One entry per word: the regression guard compares entries, so fixing some words must read as progress
+    # (live: a fix that added 4 of 6 words was rejected because one combined message changed).
+    for _w in _missing_vals:
+        missing.append(
+            f"Missing requested output value '{_w}': nothing in the code ever prints '{_w}', so values of that kind "
+            f"are never reported. The request names the exact words to print ({', '.join(_vals)}): every one must be "
+            f"printable (containers too, not only leaf values), and never Python's own names (bool, NoneType, int, "
+            f"dict, list).")
+
     # 2. Check for wasted space if requested
     req_lower = request_text.lower()
     if ("wasted" in req_lower or "waste" in req_lower) and "space" in req_lower:
@@ -87,7 +136,7 @@ def check_requirements_coverage(request_text: str, code: str) -> Tuple[bool, Lis
             missing.append("Missing duplicate disk space waste calculation/reporting.")
 
     # 3. Check for grouping if requested
-    if "group" in req_lower:
+    if "group" in req_lower and re.search(r"\bdup(e|es|licate|licates|lication)?s?\b", req_lower):
         group_terms = ["group", "groups", "grouped", "file_hashes", "duplicates_dict", "hash_map", "by_hash"]
         if not any(term in code_lower for term in group_terms):
             missing.append("Missing duplicate grouping by content logic.")
@@ -614,6 +663,7 @@ ORACLE_VERIFIED_FLAGS: Dict[str, Set[str]] = {
     "csv_column_stats": {"--column", "--delimiter", "--json"},
     "line_word_count": {"--json", "--min-words", "--sort"},
     "dotted_path_lookup": set(),
+    "json_value_types": {"--json"},
 }
 
 
@@ -661,6 +711,158 @@ def tests_only_use_verified_flags(test_code: str, test_names: List[str], request
         if verified is None or not (used - always) <= verified:
             return False
     return True
+
+
+_PY_ERROR_RE = re.compile(r"\b([A-Z][A-Za-z]*(?:Error|Exception)): ([^\n]{1,100})")
+
+
+def research_build_failure(chat: Callable[[str, int], str], request: str, feedback: str, tool_code: str,
+                           search: Optional[Callable[[str], str]] = None) -> str:
+    """Research a build failure that keeps coming back and return notes for the next fix prompt.
+
+    1. Search queries: real Python exceptions in the failure output are searched as-is; otherwise the model proposes
+       one short query.  2. Web search (when a search function is available; failures are reported, never fatal).
+    3. The model diagnoses the ROOT CAUSE in the current code from the failures plus the findings and lists the
+       exact changes, without writing the program.  `chat(prompt, max_tokens)` returns the model's text.
+    """
+    feedback = (feedback or "").strip()
+    queries: List[str] = []
+    for err, msg in _PY_ERROR_RE.findall(feedback):
+        q = f"python {err} {msg.strip()}"[:120]
+        if q not in queries:
+            queries.append(q)
+    queries = queries[:2]
+    if not queries:
+        try:
+            q = (chat("Write ONE short web search query (at most 10 words) that would find how to fix this problem "
+                      "in a Python command-line tool. Output ONLY the query.\n\nPROBLEM:\n" + feedback[-1500:], 40)
+                 or "").strip()
+            q = q.splitlines()[0].strip(" \"'`") if q else ""
+            if q:
+                queries.append(q[:120])
+        except Exception:
+            pass
+    findings: List[str] = []
+    if search:
+        for q in queries:
+            try:
+                found = str(search(q) or "").strip()
+            except Exception as exc:  # noqa: BLE001
+                found = f"(search failed: {exc})"
+            if found and not found.lower().startswith("error"):
+                findings.append(f"Search: {q}\n{found[:1200]}")
+    prompt = (
+        "A tool build keeps failing the same checks. Find the ROOT CAUSE in the current code before anyone writes "
+        "more code.\n\n"
+        f"USER REQUEST:\n{request[:2000]}\n\n"
+        f"FAILING CHECKS (real output):\n{feedback[-3000:]}\n\n"
+        f"CURRENT TOOL CODE:\n```python\n{(tool_code or '(none yet)')[:6000]}\n```\n\n"
+        + (("WEB RESEARCH FINDINGS:\n" + "\n\n".join(findings) + "\n\n") if findings else "")
+        + "Answer in plain words, no full program:\n"
+        "1. ROOT CAUSE: which lines are wrong and why (quote them).\n"
+        "2. CHANGES: the exact edits that make every failing check pass, keeping everything that already works.\n"
+        "3. If the current approach cannot work, the DIFFERENT approach to use instead."
+    )
+    try:
+        diagnosis = (chat(prompt, 600) or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        diagnosis = f"(diagnosis failed: {exc})"
+    if not diagnosis and not findings:
+        return ""
+    notes = "RESEARCH NOTES (this failure kept coming back, so it was researched before this attempt):\n"
+    if diagnosis:
+        notes += diagnosis[:1500] + "\n"
+    if findings:
+        notes += "Sources checked: " + "; ".join(queries) + "\n"
+    return notes
+
+
+def _near_miss_hint(message: str, test_body: str) -> str:
+    """'X' not found in output, but the test's input only has X glued to punctuation (e.g. 'INFO:' for 'INFO').
+
+    Live bug: tests fed 'INFO: message' lines; the tool compared the first word ('INFO:') to 'INFO' and counted every
+    line as OTHER. The model and its research missed the colon for 10+ attempts, so the mismatch is spelled out.
+    """
+    m = re.search(r"""['"]([^'"]{1,40})['"] not found in""", message or "")
+    if not m:
+        return ""
+    want = m.group(1)
+    tokens = set()
+    exact = False
+    for lit in re.findall(r"""(?:'([^'\n]*)'|"([^"\n]*)")""", test_body or ""):
+        if (lit[0] or lit[1]).strip() == want:
+            continue          # the assertion's own expected value, not test input
+        text = (lit[0] or lit[1]).replace("\\n", " ").replace("\\t", " ")
+        for tok in text.split():
+            if tok == want:
+                exact = True
+            elif want in tok:
+                tokens.add(tok)
+    if not tokens or exact:
+        return ""
+    shown = ", ".join(f"'{t}'" for t in sorted(tokens)[:3])
+    return (f" NOTE: in this test's input '{want}' only appears as {shown} (attached characters), so the tool must "
+            f"recognise '{want}' when it is followed or preceded by such characters (e.g. strip punctuation like ':' "
+            f"before comparing).")
+
+
+def is_value_lookup_request(req_lower: str) -> bool:
+    """A tool that LOOKS UP one value by a path the user gives (tomlget: "a TOML file and a dotted key path ... prints
+    the value"). Live bug: "prints every key path in dotted form" (a path LISTER) matched on the word "dotted", and the
+    lookup oracle demanded `keypaths file server.host` print 'localhost'."""
+    req_lower = (req_lower or "").lower()
+    lists_paths = re.search(r"\b(every|all|each)\s+(key\s+)?paths?\b|\blists?\b[^.]{0,40}\bpaths?\b", req_lower)
+    lookup = re.search(r"\b(and|with|takes|given)\s+an?\s+(dotted\s+)?(key\s+)?path\b|prints?\s+the\s+value"
+                       r"|\blook\s*up\b|\bpath lookup\b|\bquery\b|jsonget|tomlget|jsonquery|\bvalue\s+at\b", req_lower)
+    return bool(lookup) and not (lists_paths and not re.search(r"prints?\s+the\s+value|\blook\s*up\b", req_lower))
+
+
+def explain_test_failures(test_output: str, test_code: str, max_tests: int = 3) -> str:
+    """Pair each failing test's own code (its input) with its assertion message, as concrete fixes.
+
+    Live bug: tests fed `INFO: message` lines and the tool printed `OTHER | 1`; the raw unittest output was in the
+    prompt but the 14b model returned the identical tool five times. Showing input -> expected -> actual per test,
+    each tagged HOW TO FIX, puts the mismatch in the REQUIRED CHANGES block at the top and end of the fix prompt.
+    """
+    out = test_output or ""
+    items: List[str] = []
+    for block in re.split(r"\n=+\n", out):
+        m = re.match(r"\s*(FAIL|ERROR): (test_\w+)", block)
+        if not m:
+            continue
+        name = m.group(2)
+        msg = ""
+        for line in reversed(block.splitlines()):
+            if re.match(r"\w+(Error|Exception)\b", line.strip()):
+                msg = line.strip()
+                break
+        body = re.search(rf"def\s+{re.escape(name)}\s*\([^)]*\):\n(.*?)(?=\n[ \t]*def\s|\n\S|\Z)", test_code or "", re.S)
+        code = " ; ".join(l.strip() for l in (body.group(1) if body else "").splitlines() if l.strip())[:400]
+        near = _near_miss_hint(msg, body.group(1) if body else "")
+        _sep = separator_only_mismatch(block)
+        if _sep and not near:
+            near = (f" NOTE: the output has the same words as '{_sep[0]}' but a different separator "
+                    f"('{_sep[1][:60]}'); unless the request fixes the format, change the TEST to the tool's format.")
+        items.append(f"- Test `{name}` failed: {msg[:400] or m.group(1)}.{near} HOW TO FIX: run the tool on exactly this "
+                     f"test's input and make its output match what the test expects (unless that contradicts the "
+                     f"user request). The test does: {code}")
+        if len(items) >= max_tests:
+            break
+    if not items:
+        return ""
+    return "FAILING TESTS EXPLAINED (input -> what the test expects -> what the tool did):\n" + "\n".join(items)
+
+
+def fit_feedback(text: str, limit: int = 6000) -> str:
+    """Keep fix feedback inside the model's context. Live bug: feedback grew every attempt (research notes and
+    test output appended twice) to a 24 KB fix prompt; with an 8192-token context Ollama silently dropped the start
+    of the prompt and the model echoed the tool unchanged for many attempts. Keeps the head (research notes, failing
+    checks) and the tail (latest test output)."""
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    head = limit * 2 // 3
+    return text[:head] + "\n...[feedback trimmed to fit the model context]...\n" + text[-(limit - head):]
 
 
 def emphasize_required_fixes(prompt: str, feedback: str) -> str:
@@ -1759,9 +1961,13 @@ def infer_tool_input_kind(
         return "multi_file"
 
     # 3. CSV (distinguish from JSON output flag)
-    is_csv_req = any(k in req_l for k in ("csv", "comma-separated", "delimiter", "numeric column", "header row", "column name")) or \
+    # The REQUEST decides. "header row" was dropped: it usually describes the OUTPUT table (live bug: a log-level
+    # counter asked for "a table with a header row" and was built as a CSV statistics tool). The tool's own code only
+    # counts when the request names no input kind, otherwise a wrong CSV draft kept the build in CSV mode forever.
+    names_other_input = any(k in req_l for k in ("log file", "text file", "plain text", "lines of text", "each line", "every line", "per line", ".log", ".txt"))
+    is_csv_req = any(k in req_l for k in ("csv", "comma-separated", "delimiter", "numeric column", "column name")) or \
                  any(k in p_l for k in ("csv", "colsummary", "tabstats", "numstats", "colstats")) or \
-                 ("csv" in code_l or "dictreader" in code_l)
+                 (not names_other_input and ("csv" in code_l or "dictreader" in code_l))
     if is_csv_req:
         return "csv"
 
@@ -2324,6 +2530,53 @@ def determine_fix_strategy(
     return "fix"
 
 
+def _test_block(test_output: str, name: str) -> str:
+    """The unittest output block of ONE failing test (whole output when not found)."""
+    for b in re.split(r"\n=+\n", test_output or ""):
+        if re.match(rf"\s*(FAIL|ERROR): {re.escape(name)}\b", b):
+            return b
+    return test_output or ""
+
+
+def _norm_sep(s: str) -> str:
+    return re.sub(r"[\s._:\-=/|,]+", " ", (s or "").replace("\\n", " ")).strip().lower()
+
+
+def separator_only_mismatch(block: str) -> Optional[Tuple[str, str]]:
+    """'config.object' not found in '...config object...': the same words with a different separator.
+    Live: keypaths tests expected 'config.object' while the tool printed 'config object'; the request said only
+    "the key path together with the type", so the format was the test's own assumption."""
+    m = re.search(r"AssertionError: '([^'\n]{2,80})' not found in '([^\n]*)'", block or "")
+    if not m:
+        return None
+    want, got = m.group(1), m.group(2)
+    if want in got or not _norm_sep(want) or " " not in _norm_sep(want):
+        return None
+    return (want, got[:120]) if _norm_sep(want) in _norm_sep(got) else None
+
+
+def test_code_crashed(test_output: str, tool_name: str) -> bool:
+    """True when every failing test ERRORED inside the test code itself (not an assertion about the tool).
+
+    The tool runs in a subprocess during tests, so a traceback in an ERROR block that never passes through
+    `<tool>.py` is a bug in the test (live: `self.text_file(content)` -> TypeError in all six tests, which was
+    blamed on the tool for 270 attempts). A subprocess timeout is excluded: that means the tool hung.
+    """
+    out = test_output or ""
+    blocks = [b for b in re.split(r"\n=+\n", out) if re.match(r"\s*(ERROR|FAIL): ", b)]
+    if not blocks:
+        return False
+    for b in blocks:
+        if not b.lstrip().startswith("ERROR: ") or "TimeoutExpired" in b or "AssertionError" in b:
+            return False
+        frames = [re.split(r"[\\/]", f)[-1] for f in re.findall(r'File "([^"]+)"', b)]
+        if tool_name and f"{tool_name}.py" in frames:
+            return False
+        if not re.search(r"^\w+(Error|Exception)\b", b, re.M):
+            return False
+    return True
+
+
 def arbitrate_test_failure(
     request: str,
     tool_code: str,
@@ -2391,6 +2644,28 @@ def arbitrate_test_failure(
             "lock_tool": False,
         }
 
+    if test_code_crashed(test_output, t_name):
+        return {
+            "classification": "TEST",
+            "reason": "Every failing test crashed inside the test code itself (no assertion about the tool ran), "
+                      "so the tests must be fixed, not the tool.",
+            "lock_tool": True,
+        }
+
+    _vals = requested_output_values(request)
+    if _vals and failing_tests:
+        _py_names = [n for n in ("dict", "list", "NoneType", "bool", "int", "str", "float") if n.lower() not in _vals]
+        _name_re = re.compile(r"""['"][^'"\n]*\b(""" + "|".join(_py_names) + r""")\b[^'"\n]*['"]""")
+        for _t in failing_tests:
+            _m = re.search(rf"def\s+{re.escape(_t)}\s*\([^)]*\):(.*?)(?=\n[ \t]*def\s|\Z)", test_code or "", re.DOTALL)
+            if _m and _name_re.search(_m.group(1)):
+                return {
+                    "classification": "TEST",
+                    "reason": (f"Failing test '{_t}' expects a Python type name, but the request lists the exact output "
+                               f"words ({', '.join(_vals)}); the test must assert those words."),
+                    "lock_tool": False,
+                }
+
     # 2. Check for test fixture/import errors (only if NOT inside tool code or assertion diff)
     if any(k in (test_output or "") for k in ("NameError:", "ModuleNotFoundError:", "ImportError:")):
         if not (t_name and f'File "{t_name}.py"' in test_output):
@@ -2400,6 +2675,17 @@ def arbitrate_test_failure(
                 "lock_tool": True,
             }
 
+    for _t in failing_tests or []:
+        _sep = separator_only_mismatch(_test_block(test_output, _t))
+        if _sep and _sep[0].lower() not in (request or "").lower():
+            return {
+                "classification": "TEST",
+                "reason": (f"Failing test '{_t}' expects '{_sep[0]}' but the tool prints the same words with a different "
+                           f"separator ('{_sep[1][:80]}'); the request does not fix that format, so the test must match "
+                           f"the tool's output."),
+                "lock_tool": False,
+            }
+
     # Guard: if a failing test asserts a requested option or core feature:
     req_flags = extract_requested_flags(request)
     if req_flags:
@@ -2407,31 +2693,32 @@ def arbitrate_test_failure(
             m_body = re.search(rf"def\s+{re.escape(test_name)}\s*\([^)]*\):(.*?)(?=\n[ \t]*def\s|\Z)", test_code, re.DOTALL)
             if m_body:
                 body_text = m_body.group(1)
+                _blk = _test_block(test_output, test_name)
                 for flag in req_flags:
                     flag_norm = flag.lstrip("-").replace("-", "_")
                     if flag in body_text or flag_norm in body_text:
                         # Check if the tool failed to produce output or produced empty output on the option
-                        if "not found in ''" in (test_output or "") or 'not found in ""' in (test_output or ""):
+                        if "not found in ''" in _blk or 'not found in ""' in _blk:
                             return {
                                 "classification": "TOOL",
                                 "reason": f"Failing test '{test_name}' asserts requested option '{flag}' behaviour: tool produced empty output",
                                 "lock_tool": False,
                             }
                         # If there is a value assertion mismatch against valid non-empty tool output, it's a TEST defect (R8-4)
-                        if any(p in (test_output or "") for p in ("AssertionError:", "assertEqual", "assertIn", "assertNotIn")):
-                            if "not found in" in (test_output or ""):
+                        if any(p in _blk for p in ("AssertionError:", "assertEqual", "assertIn", "assertNotIn")):
+                            if "not found in" in _blk:
                                 return {
                                     "classification": "TEST",
                                     "reason": f"Failing test '{test_name}' has assertion mismatch against valid tool output on requested option '{flag}' (test hallucinated values or wrong indices)",
                                     "lock_tool": True,
                                 }
-                            if re.search(r"\d+\s*!=\s*\d+", test_output or ""):
+                            if re.search(r"\d+\s*!=\s*\d+", _blk):
                                 return {
                                     "classification": "TEST",
                                     "reason": f"Failing test '{test_name}' has numeric assertion mismatch against valid tool output on requested option '{flag}'",
                                     "lock_tool": True,
                                 }
-                            if re.search(r"['\"][^'\"]+['\"]\s*!=\s*['\"][^'\"]+['\"]", test_output or ""):
+                            if re.search(r"['\"][^'\"]+['\"]\s*!=\s*['\"][^'\"]+['\"]", _blk):
                                 return {
                                     "classification": "TEST",
                                     "reason": f"Failing test '{test_name}' has ordering/naming assertion mismatch against valid tool output on requested option '{flag}'",
@@ -3529,6 +3816,11 @@ class OracleRegistry:
         """
         import tempfile
         temp_dir = Path(tempfile.mkdtemp(prefix="oracle_lines_"))
+        # The checks look for "f1"/"f2"/"f3" in output that shows full paths; a random folder name such as
+        # "oracle_lines_4k_o_rf2" made a correct tool fail ("should hide f2"). Draw names without f<digit>.
+        while re.search(r"f\d", temp_dir.name.lower()):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            temp_dir = Path(tempfile.mkdtemp(prefix="oracle_lines_"))
         try:
             f1 = temp_dir / "f1.txt"
             f2 = temp_dir / "f2.txt"
@@ -3801,6 +4093,69 @@ class OracleRegistry:
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    @staticmethod
+    def oracle_json_value_types(tool_path: Path, request: str, project_dir: Path) -> Tuple[bool, str]:
+        """A tool that reports the JSON type of each value must name every type correctly.
+
+        Live: keypaths passed its own tests while printing `debug number` for `true` (bool is a subclass of int, so
+        the int check matched first) and an extra line with an empty path for the root object.
+        """
+        import json as _json
+        import tempfile
+        doc = {"flag": True, "count": 3, "ratio": 1.5, "label": "x", "nothing": None, "items": [1], "obj": {"k": "v"}}
+        want = {"flag": "boolean", "count": "number", "ratio": "number", "label": "string", "nothing": "null",
+                "items": "array", "obj": "object"}
+        tmp = Path(tempfile.mkdtemp(prefix="oracle_types_"))
+        try:
+            f = tmp / "types.json"
+            f.write_text(_json.dumps(doc), encoding="utf-8")
+            proc = subprocess.run([sys.executable, str(tool_path), str(f)], cwd=str(project_dir), capture_output=True,
+                                  text=True, encoding="utf-8", errors="replace", timeout=20.0)
+            if proc.returncode != 0:
+                return False, f"default mode failed on a valid JSON file (exit {proc.returncode}): {proc.stderr[:200]}"
+            lines = [l for l in proc.stdout.splitlines() if l.strip()]
+            wrong = []
+            dupes = []
+            for key, typ in want.items():
+                key_lines = [l for l in lines if re.match(rf"\s*['\"]?{key}['\"]?\b(?![.\[])", l)]
+                if len(key_lines) > 1:
+                    dupes.append(f"{key}: {key_lines}")
+                    continue
+                line = key_lines[0] if key_lines else None
+                if line is None or not re.search(rf"\b{typ}\b", line):
+                    wrong.append(f"{key} should be {typ}, line: {line!r}")
+            if dupes:
+                return False, ("prints the same path more than once (" + "; ".join(dupes[:3]) + "). HOW TO FIX: print "
+                               "each path exactly ONCE with the type of ITS OWN value; do not also print a dict's keys "
+                               "as 'object' - only the dict's own path is an object.")
+            if wrong:
+                return False, ("wrong type names for " + "; ".join(wrong[:4]) + ". HOW TO FIX: check bool BEFORE "
+                               "int/float (bool is a subclass of int in Python), map dict->object, list->array, "
+                               "str->string, int/float->number, None->null.")
+            if any(re.match(r"^\s*(object|array)\s*$", l) for l in lines):
+                return False, ("prints a line with an empty path for the root value. HOW TO FIX: only print entries "
+                               "that have a key path; skip the root itself.")
+            if "--json" in request:
+                pj = subprocess.run([sys.executable, str(tool_path), str(f), "--json"], cwd=str(project_dir),
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20.0)
+                try:
+                    data = _json.loads(pj.stdout)
+                except Exception as exc:  # noqa: BLE001
+                    return False, f"--json output is not valid JSON: {exc}"
+                if isinstance(data, dict):
+                    if "" in data:
+                        return False, ("--json output has an entry with an empty path for the root value. HOW TO FIX: "
+                                       "skip the root itself.")
+                    bad = [f"{k}={data.get(k)!r} (want {t})" for k, t in want.items() if data.get(k) != t]
+                    if bad:
+                        return False, ("--json types wrong: " + ", ".join(bad[:4]) + ". HOW TO FIX: check bool BEFORE "
+                                       "int/float; use the requested type words.")
+            return True, ""
+        except subprocess.TimeoutExpired:
+            return False, "timed out on a small JSON file"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     @classmethod
     def applicable_oracles(cls, request: str) -> List[str]:
         """Names of the reference oracles that apply to this request (empty = nothing independent checks the tool)."""
@@ -3813,7 +4168,7 @@ class OracleRegistry:
         if is_colstats:
             names.append("csv_column_stats")
         is_path_lookup = (
-            any(k in req_lower for k in ("dotted", "path lookup", "query", "tomlget", "jsonget", "jsonquery"))
+            is_value_lookup_request(req_lower)
             and any(k in req_lower for k in ("toml", "json", "key", "path"))
             and not is_colstats
         )
@@ -3825,6 +4180,9 @@ class OracleRegistry:
         )
         if is_line_count:
             names.append("line_word_count")
+        _json_types = {"object", "array", "string", "number", "boolean", "null"}
+        if "json" in req_lower and len(_json_types & set(requested_output_values(request))) >= 4:
+            names.append("json_value_types")
         return names
 
     @classmethod
@@ -3847,6 +4205,11 @@ class OracleRegistry:
             ok, err = cls.oracle_line_word_count(tool_path, request, project_dir)
             if not ok:
                 issues.append(f"Oracle line-word-count defect: {err}")
+
+        if "json_value_types" in applicable:
+            ok, err = cls.oracle_json_value_types(tool_path, request, project_dir)
+            if not ok:
+                issues.append(f"Oracle json-value-types defect: {err}")
 
         return (len(issues) == 0), issues
 

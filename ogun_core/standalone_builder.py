@@ -25,6 +25,11 @@ from ogun_core.engine import CoreEngine
 from ogun_core.paths import OGUN_ROOT
 from ogun_core.quality import (
     emphasize_required_fixes,
+    explain_test_failures,
+    map_python_type_names,
+    is_value_lookup_request,
+    fit_feedback,
+    research_build_failure,
     tests_only_use_verified_flags,
     BuildStatus,
     OracleRegistry,
@@ -135,6 +140,8 @@ def run_tool(
 
 
 class ToolTestCase(unittest.TestCase):
+    # Fixture files are written as exact bytes: text mode on Windows turned every \\n into \\r\\n, so byte
+    # counts a test expected (e.g. 10 bytes) came out larger (16) and correct tools failed.
     """Base class for tool tests providing per-test temp directory and assertions."""
 
     def setUp(self) -> None:
@@ -154,7 +161,7 @@ class ToolTestCase(unittest.TestCase):
         if isinstance(text_or_bytes, bytes):
             p.write_bytes(text_or_bytes)
         else:
-            p.write_text(text_or_bytes, encoding=encoding)
+            p.write_bytes(text_or_bytes.encode(encoding))
         return p
 
     def make_dir(self, name: str) -> Path:
@@ -163,23 +170,51 @@ class ToolTestCase(unittest.TestCase):
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def csv_file(self, name: str, rows: List[List[Any]], delimiter: str = ",") -> Path:
-        """Create a CSV file from list of row lists inside the isolated temp directory."""
+    # Models naturally write self.text_file(content) / self.csv_file(rows) / self.json_file(obj) with ONE argument
+    # (live bug: every logsum test crashed with "text_file() missing 1 required positional argument"). One argument
+    # that does not look like a file name is the content, and the file gets an automatic name.
+    _auto_n = 0
+
+    def _auto_name(self, ext: str) -> str:
+        type(self)._auto_n += 1
+        return f"input_{type(self)._auto_n}{ext}"
+
+    @staticmethod
+    def _looks_like_name(s: Any) -> bool:
+        return (isinstance(s, str) and 0 < len(s) <= 120 and chr(10) not in s and " " not in s.strip()
+                and "," not in s and "." in s.strip(".") and len(s.rsplit(".", 1)[-1]) <= 5)
+
+    def csv_file(self, name: Any, rows_or_text: Any = None, delimiter: str = ",") -> Path:
+        """Create a CSV file: csv_file(name, rows_or_text) or csv_file(rows_or_text)."""
+        if rows_or_text is None:
+            name, rows_or_text = (name, "") if self._looks_like_name(name) else (self._auto_name(".csv"), name)
         p = (self.tmp / name).resolve()
         p.parent.mkdir(parents=True, exist_ok=True)
-        import csv
-        with open(p, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f, delimiter=delimiter)
-            writer.writerows(rows)
+        if isinstance(rows_or_text, str):
+            p.write_bytes(rows_or_text.encode("utf-8"))
+        else:
+            import csv
+            with open(p, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f, delimiter=delimiter).writerows(rows_or_text)
         return p
 
-    def text_file(self, name: str, text: str, encoding: str = "utf-8") -> Path:
-        """Create a plain text file inside the isolated temp directory."""
-        return self.write_file(name, text, encoding=encoding)
+    def text_file(self, name: str, text: Optional[str] = None, encoding: str = "utf-8") -> Path:
+        """Create a plain text file: text_file(name, text) or text_file(text)."""
+        if text is None:
+            name, text = (name, "") if self._looks_like_name(name) else (self._auto_name(".txt"), name)
+        p = (self.tmp / name).resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(text.encode(encoding))
+        return p
 
-    def json_file(self, name: str, obj: Any, encoding: str = "utf-8") -> Path:
-        """Create a JSON file inside the isolated temp directory."""
-        return self.write_file(name, json.dumps(obj, indent=2), encoding=encoding)
+    def json_file(self, name: Any, data: Any = ..., encoding: str = "utf-8") -> Path:
+        """Create a JSON file: json_file(name, data) or json_file(data)."""
+        if data is ...:
+            name, data = self._auto_name(".json"), name
+        p = (self.tmp / name).resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(json.dumps(data, indent=2, ensure_ascii=False).encode(encoding))
+        return p
 
     def folder(self, name: str, files: Dict[str, Union[str, bytes]]) -> Path:
         """Create a directory with relative file paths and contents inside the isolated temp directory."""
@@ -190,7 +225,7 @@ class ToolTestCase(unittest.TestCase):
             if isinstance(content, bytes):
                 fp.write_bytes(content)
             else:
-                fp.write_text(content, encoding="utf-8")
+                fp.write_bytes(content.encode("utf-8"))
         return d
 
     def run_tool(
@@ -1002,6 +1037,7 @@ STATIC_BUILDER_SYSTEM_PREFIX = (
     "CORE ENGINEERING CONTRACT (STATIC PREFIX):\n"
     "- Use Python standard library modules only (no third-party packages). Import ONLY the modules your file actually uses; NEVER import unittest or define TestCase classes inside the CLI tool file.\n"
     "- Stream the input (iterate rows/lines); never read whole large files into memory. Peak memory must stay under 150 MB on a 50 MB input.\n"
+    "- Empty input: count the lines/rows INSIDE the streaming loop and, after the loop, if the count is 0 print an error to stderr and exit 1. NEVER detect emptiness with f.tell(), f.read() or os.path.getsize() on an open argparse file (tell() is 0 at the start of every file, so it rejects valid input).\n"
     "- At the start of main(): `if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')`. Print JSON with `json.dumps(..., indent=2, ensure_ascii=False)`.\n"
     "- Missing/unreadable input: print a clear message to stderr and exit 1. No tracebacks for user errors. `--help` exits 0. Default mode (no options) must succeed on any valid input.\n"
     "- Every option must work alone and combined with every other option (e.g. a filter/selector option must also apply in --json mode).\n"
@@ -1101,8 +1137,10 @@ def build_tool_generation_prompt(request_text: str, project_name: str, flags: An
     is_csv = kind == "csv"
     is_table = any(k in req for k in ("table", "aligned", "column"))
     is_stats = any(k in req for k in ("mean", "average", "minimum", "maximum", "count", "statistic"))
-    is_listing_total = "total" in req
-    is_lookup = any(k in req for k in ("dotted", "key path", "path like", "lookup", "query"))
+    # Only an explicit total row/line request (live bug: 'total bytes' - a column - added a Total row and the
+    # word-count template to a file-extension counter, and its tests demanded that row).
+    is_listing_total = bool(re.search(r"\btotal\s+(line|row)s?\b|\btotals\b|\bgrand total\b|\ba total\b", req))
+    is_lookup = is_value_lookup_request(req)
     has_selector = "--column" in req or "--field" in req or "--key" in req
 
     parts = [
@@ -1326,7 +1364,7 @@ def update_standalone_project(
     engine: Any,
     project_name: str,
     change_request: str,
-    max_attempts: int = 5,
+    max_attempts: Optional[int] = 5,
     on_progress: Optional[Callable[[str, int], None]] = None,
     build_fn: Optional[Callable[..., Tuple[bool, str, Dict[str, Any]]]] = None,
 ) -> Tuple[bool, str, Dict[str, Any]]:
@@ -1356,6 +1394,10 @@ def update_standalone_project(
         shutil.move(str(test_path), str(backup_dir / test_path.name))
     success, msg, details = (build_fn or build_standalone_project_staged)(engine, combined, max_attempts=max_attempts,
                                                                           on_progress=on_progress)
+    if (details or {}).get("stopped"):
+        # The user stopped it: put the previous tool back and say so (not "option missing", which is misleading).
+        restored = _restore_pre_update(project_dir, project_name, backup_dir)
+        return False, f"Update of `{project_name}` stopped, as you asked. {restored}".strip(), details
     new_flags = sorted(set(extract_requested_flags(change_request)) - set(extract_requested_flags(original)))
     missing = help_lists_options(tool_path, new_flags) if new_flags and tool_path.exists() else []
     if not missing and new_flags and success:
@@ -1393,6 +1435,11 @@ def build_standalone_project_staged(*args: Any, **kwargs: Any) -> Tuple[bool, st
     attempts of one build, but leaving it behind made every delivered project 40-50 MB)."""
     try:
         return _build_standalone_project_staged_impl(*args, **kwargs)
+    except KeyboardInterrupt:
+        print("\n[Ogun Builder] Build stopped by the user (Ctrl+C).", flush=True)
+        return (False, "Stopped building the tool, as you asked (Ctrl+C). It had not passed yet; the files remain on "
+                       "disk, so asking again resumes from them.",
+                {"status": "stopped", "stopped": True, "error": "Stopped by the user"})
     finally:
         try:
             _req = kwargs.get("request_text") if "request_text" in kwargs else next((a for a in args if isinstance(a, str)), "")
@@ -1406,10 +1453,13 @@ def build_standalone_project_staged(*args: Any, **kwargs: Any) -> Tuple[bool, st
 def _build_standalone_project_staged_impl(
     engine: CoreEngine,
     request_text: str,
-    max_attempts: int = 5,
+    max_attempts: Optional[int] = 5,
     on_progress: Optional[Callable[[str, int], None]] = None,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """Build, test, verify, and refine a standalone CLI project in workspace/<name>/.
+
+    max_attempts <= 0 (or None) means NO LIMIT: the build keeps fixing, and researches failures that keep coming back,
+    until it passes or the user presses Ctrl+C.
 
     Executes in stages: (1) write tool, (2) smoke runs & memory gate, (3) grounded tests, (4) unit test & fix.
     Ensures files are retained on disk and reports truthfully from real execution output.
@@ -1483,7 +1533,34 @@ def _build_standalone_project_staged_impl(
     prev_tool_info: Optional[Tuple[str, str, Any]] = None
     unrequested_fixed: bool = False
 
-    while attempt < max_attempts:
+    unbounded = not max_attempts or max_attempts <= 0
+    limit: float = float("inf") if unbounded else float(max_attempts)
+    of_total = "" if unbounded else f"/{max_attempts}"
+    research_notes = ""
+    stuck_streak = 0
+    model_error_streak = 0
+    research_search: Optional[Callable[[str], str]] = None
+    if unbounded and client_obj is not None and type(client_obj).__module__ != "unittest.mock" \
+            and not hasattr(client_obj, "responses") and not hasattr(client_obj, "call_history"):
+        from ogun_core.research import search_web, web_research_enabled
+        if web_research_enabled():
+            research_search = lambda q: search_web(q, 3)  # noqa: E731
+
+    def _research_chat(text: str, max_tokens: int) -> str:
+        r = _chat_with_options(engine.client, [{"role": "user", "content": text}],
+                               options={**runtime_model_opts, "num_predict": max_tokens, "temperature": 0.3})
+        return (r or {}).get("content", "")
+
+    if unbounded:
+        _notify("No attempt limit: this build keeps researching and fixing until it passes. Press Ctrl+C to stop it.", 15)
+
+    while attempt < limit:
+        # Model-call errors (e.g. Ollama down) fail instantly; back off instead of spinning (Ctrl+C still stops).
+        model_error_streak = model_error_streak + 1 if re.match(r"(Model call|Test generation|Fix) error", last_error or "") else 0
+        if unbounded and model_error_streak:
+            time.sleep(min(60, 5 * model_error_streak))
+        force_research = False
+        last_error = ""
         attempt += 1
         attempt_dir = build_log_dir / f"attempt_{attempt}"
         attempt_dir.mkdir(parents=True, exist_ok=True)
@@ -1495,7 +1572,7 @@ def _build_standalone_project_staged_impl(
             shutil.copy2(test_path, attempt_dir / f"backup_test_{project_name}.py")
 
         writes_log: Dict[str, Any] = {}
-        _notify(f"[Attempt {attempt}/{max_attempts}] Generating / refining '{project_name}'...", 20 + attempt * 12)
+        _notify(f"[Attempt {attempt}{of_total}] Generating / refining '{project_name}'...", min(20 + attempt * 12, 90))
 
         # Stage 1: Generate tool if missing
         if not tool_code:
@@ -1581,9 +1658,9 @@ def _build_standalone_project_staged_impl(
                     and not any(kw in str(mock_client.responses[0]) for kw in ("import ", "class ", "def "))
                 )
                 if is_chat_resumption:
-                    all_timeouts = max_attempts
+                    all_timeouts = limit
                     break
-                if attempt >= max_attempts:
+                if attempt >= limit:
                     break
                 continue
 
@@ -1684,6 +1761,7 @@ def _build_standalone_project_staged_impl(
                 f"{fixtures_guide}\n"
                 f"   CRITICAL: Never create .json fixtures if the tool is not a JSON tool, even if it has a --json output option! All input files MUST match kind '{kind}'.\n"
                 "4. REQUESTED OPTIONS COVERAGE: Ensure every option and flag requested by the user is exercised in at least one test method.\n"
+                "   When the request lists exact output words in parentheses (e.g. '(object, array, string, number, boolean or null)'), assert THOSE words, never Python's own names (bool, NoneType, int, dict, list), even if the current implementation prints Python's names.\n"
                 "5. MEANINGFUL ASSERTIONS & TEST PRECISION (R10-3, R11-1): Reject trivial assertions. When asserting on table text output, assert that column names and numerical values are present in stdout (e.g. self.assertIn('col_a', res.stdout) and self.assertIn('20.0', res.stdout)). NEVER assert full multi-column formatted strings with pipes (e.g. 'col_a | 2 | 10.0') because padding spaces vary across implementations! For help tests, use self.assertIn('usage:', res.stdout.lower()). Never assert hardcoded character counts that are off by 1-2 chars (e.g. 58 vs 57, 100 vs 99). For floating-point statistics (mean, avg), format or round appropriately (e.g. `11.666667` or `self.assertAlmostEqual(..., delta=0.01)`) rather than rigid full-precision string comparisons like `'11.666666666666666'`. Every test method must assert on `result.returncode`, `result.stdout`, or `result.stderr` specifically, using `self.assertOk(res)`, `self.assertFails(res)`, `self.assertIn(...)`, or `self.assertJsonOutput(res)`.\n"
                 "   PRECOMPUTED FIXTURE COUNTS (Use these exact values in your assertions - do NOT compute by hand!):\n"
                 "   * If testing text counting:\n"
@@ -1762,7 +1840,7 @@ def _build_standalone_project_staged_impl(
                             # option never added. Only the last attempt ends the build; otherwise the fix stage runs
                             # (keeping coverage/smoke failures) and the next attempt writes the tests again.
                             last_error = (last_error + "\n" if last_error else "") + _tests_invalid
-                            if attempt >= max_attempts:
+                            if attempt >= limit:
                               return (
                                 False,
                                 f"Tests rejected on deterministic validation:\n" + "\n".join(f"- {i}" for i in val_issues_2),
@@ -1830,9 +1908,9 @@ def _build_standalone_project_staged_impl(
                     and not any(kw in str(mock_client.responses[0]) for kw in ("import ", "class ", "def "))
                 )
                 if is_chat_resumption:
-                    all_timeouts = max_attempts
+                    all_timeouts = limit
                     break
-                if attempt >= max_attempts:
+                if attempt >= limit:
                     break
                 # Do NOT skip to the next attempt: a tool that is missing a requested option (coverage /
                 # smoke / oracle failure) must still reach the fix stage. Live bug: three test-writing
@@ -1854,6 +1932,11 @@ def _build_standalone_project_staged_impl(
             test_res_str = f"Smoke test crash / traceback in default mode:\n{smoke_report}"
         elif test_code:
             _notify("Running unit tests via real interpreter...", 80)
+            _mapped_tests = map_python_type_names(test_code, request_text)
+            if _mapped_tests != test_code:
+                _notify("Test repair: replaced Python type names with the output words the request names.", 80)
+                test_code = _mapped_tests
+                test_path.write_text(test_code, encoding="utf-8")
             ensure_unittest_main_guard(test_path)
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=2) as _pool:
@@ -1952,8 +2035,11 @@ def _build_standalone_project_staged_impl(
             sim = difflib.SequenceMatcher(None, tool_code, prev_code).ratio() if (tool_code and prev_code) else 0.0
             is_identical = (tool_sha_now == prev_sha) or (sim >= 0.95)
             if is_identical and failure_sig == prev_sig:
-                _notify(f"Loop guard: tool regeneration is identical across attempts ({sim*100:.1f}% similarity) with same failure signature. Halting loop to prevent spinning.", -1)
-                break
+                if not unbounded:
+                    _notify(f"Loop guard: tool regeneration is identical across attempts ({sim*100:.1f}% similarity) with same failure signature. Halting loop to prevent spinning.", -1)
+                    break
+                _notify(f"Loop guard: the tool came back {sim*100:.1f}% identical with the same failure. Researching a different approach.", 85)
+                force_research = True
         prev_tool_info = (tool_code, tool_sha_now, failure_sig)
 
         # Stage 5: Arbitration & Fix Stage
@@ -1974,6 +2060,12 @@ def _build_standalone_project_staged_impl(
         lock_tool = arb_res.get("lock_tool", False)
         arb_reason = arb_res.get("reason", "")
         _notify(f"Arbitration decision: {defect_type} defect ({arb_reason})", 85)
+        if (unbounded and attempt >= 3 and failing_tests and covered and smoke_ok and mem_ok
+                and (defect_type == "TEST" or lock_tool)
+                and all(tests_only_use_verified_flags(test_code, [t], request_text) for t in failing_tests)):
+            _notify("The tool passes every independent check; only my own tests of independently verified options "
+                    "are wrong. Finishing with those tests set aside.", 90)
+            break
 
         # Track best-so-far candidate
         failing_history.append(set(failing_tests))
@@ -2001,8 +2093,15 @@ def _build_standalone_project_staged_impl(
         fail_str = f"Failing tests: {', '.join(failing_tests)}" if failing_tests else (last_error[:120] if last_error else test_res_str[:120])
         _notify(f"Tests/checks failed on attempt {attempt}: {fail_str}", 85)
         if test_res_str and failing_tests:
-            last_error = (last_error + "\n\n" if last_error else "") + f"UNIT TEST OUTPUT:\n{test_res_str[-3000:]}"
+            _explained = explain_test_failures(test_res_str, test_code)
+            last_error = (last_error + "\n\n" if last_error else "") + (_explained + "\n\n" if _explained else "") \
+                + f"UNIT TEST OUTPUT:\n{test_res_str[-1500:] if _explained else test_res_str[-3000:]}"
         last_error = last_error or f"Unit tests failed:\n{test_res_str}"
+        # Tell the fix stage WHY the tests were blamed (live: keypaths tests were regenerated four times with the same
+        # wrong 'dict' expectations because the arbitration reason never reached the prompt).
+        if defect_type == "TEST" and arb_reason and "TEST DEFECT" not in (last_error or ""):
+            last_error = (f"TEST DEFECT (the tests are wrong, not the tool): {arb_reason} HOW TO FIX: rewrite the "
+                          f"failing tests so they match the user request.\n") + (last_error or "")
 
         # Strategy transition table
         fix_stage = determine_fix_strategy(
@@ -2021,8 +2120,37 @@ def _build_standalone_project_staged_impl(
             _notify(f"Stuck loop detected: rotating strategy to '{fix_stage}' (Attempt {attempt})", 86)
             strategy_step += 1
 
+        # Unbounded builds research a failure that keeps coming back (loop guard) and every third attempt.
+        if unbounded and (force_research or attempt % 3 == 0):
+            _notify(f"Researching the failure before attempt {attempt + 1} (web search + root-cause analysis)...", 87)
+            try:
+                research_notes = research_build_failure(_research_chat, request_text, last_error, tool_code,
+                                                        research_search) or research_notes
+            except Exception as exc:  # noqa: BLE001
+                _notify(f"Research step failed: {exc}", -1)
+            if research_notes:
+                (attempt_dir / "research.txt").write_text(research_notes, encoding="utf-8")
+            if force_research:
+                no_op_streak = max(no_op_streak, 1)   # the next fix samples at a higher temperature
+                strategy_step += 1
+        stuck_streak = stuck_streak + 1 if force_research else 0
+        if unbounded and stuck_streak >= 5:
+            # Five identical failures in a row: patching this draft is not working (live: 270 attempts on one wrong
+            # draft). Start over - rewrite the tool and its tests from scratch, guided by the research notes.
+            _notify("The same failure came back 5 times in a row; starting the tool and its tests over from scratch.", 87)
+            tool_code, test_code, stuck_streak, prev_tool_info = "", "", 0, None
+            for _p in (tool_path, test_path):
+                try:
+                    _p.unlink()
+                except OSError:
+                    pass
+            continue
+        if research_notes and research_notes not in (last_error or ""):
+            last_error = research_notes + "\n" + (last_error or "")
+        last_error = fit_feedback(last_error)
+
         # Execute Fix Stage if attempts remain
-        if attempt < max_attempts:
+        if attempt < limit:
             tool_kind = infer_tool_input_kind(request_text, contract, '', project_name)
             tool_fixtures_info = fixtures_for(tool_kind)
             fix_fixtures_guide = tool_fixtures_info.get("prompt_guidance", "")
@@ -2261,7 +2389,7 @@ def _build_standalone_project_staged_impl(
                     and not any(kw in str(mock_client.responses[0]) for kw in ("import ", "class ", "def "))
                 )
                 if is_chat_resumption:
-                    all_timeouts = max_attempts
+                    all_timeouts = limit
                     break
                 strategy_step += 1
 
@@ -2281,7 +2409,7 @@ def _build_standalone_project_staged_impl(
         (attempt_dir / "file_writes.json").write_text(json.dumps(writes_log, indent=2), encoding="utf-8")
 
     # If all attempts timed out during model generation, report truthfully
-    if all_timeouts >= max_attempts and max_attempts > 0:
+    if all_timeouts >= limit and limit > 0:
         existing_files = []
         if tool_path.exists():
             existing_files.append(f"- Tool: `{tool_path}` (sha256: `{get_sha256(tool_path)[:16]}...`)")
@@ -2289,7 +2417,7 @@ def _build_standalone_project_staged_impl(
             existing_files.append(f"- Tests: `{test_path}` (sha256: `{get_sha256(test_path)[:16]}...`)")
         files_str = "\n".join(existing_files) if existing_files else "No files were successfully written."
 
-        _notify(f"Failed to complete '{project_name}': all {max_attempts} attempts timed out during model calls.", -1)
+        _notify(f"Failed to complete '{project_name}': all {attempt} attempts timed out during model calls.", -1)
         fail_msg = (
             f"Failed to build `{project_name}`: all {attempt} attempts timed out during model generation.\n\n"
             f"### Error Details:\n```text\n{last_error}\n```\n\n"
@@ -2420,7 +2548,7 @@ def _build_standalone_project_staged_impl(
         diagnosis_verdict = f"\n\n**Assessment:** For `{project_name}.py`, the tool meets the requirements in my checks; these {len(failing_tests)} of my own tests are still wrong: {', '.join(failing_tests)}."
 
     fail_list = "\n".join(f"- `{t}`" for t in failing_tests) if failing_tests else "- None"
-    _notify(f"Failed to complete '{project_name}' after {max_attempts} attempts: {final_status}", -1)
+    _notify(f"Failed to complete '{project_name}' after {attempt} attempts: {final_status}", -1)
 
     fail_msg = (
         f"Failed to build `{project_name}`: tests still failing after {attempt} attempt{'s' if attempt > 1 else ''} ({final_status}).{diagnosis_verdict}\n\n"

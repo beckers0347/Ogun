@@ -149,7 +149,7 @@ What happens:
 1. The model is prompted with a strict template and must return exactly two fenced Python blocks: the tool and its test.
 2. Ogun checks the code (AST validation: no placeholders, stubs or `pass`-only methods).
 3. The files are written to `plugins/custom_tools/` and `plugins/tests/`.
-4. The test runs in a **separate process** (UTF-8, with a timeout). If it fails, the traceback is fed back to the model and it retries (up to 3 attempts in the harness).
+4. The test runs in a **separate process** (UTF-8, with a timeout). If it fails, the traceback is fed back to the model and it tries again, **with no attempt limit**, until the test passes. Press `Ctrl+C` to stop a build (see [Builds run until they pass](#builds-run-until-they-pass)).
 5. If it passes, the plugin is hot-loaded and recorded in `plugins/registry.json`.
 
 **Check it works on your machine:**
@@ -188,6 +188,14 @@ Save it as `plugins/custom_tools/echo_tool.py` and put a plain-Python test in `p
 
 ---
 
+### Builds run until they pass
+
+Plugin builds, tool builds and tool updates have **no attempt limit** by default. After each failure the model gets the test output and tries again. When the same failure repeats, and every third attempt, Ogun first asks the model for a root-cause diagnosis. After five identical failures in a row it throws the code away and starts fresh.
+
+- **Stop a build** with `Ctrl+C`. A stopped update leaves the previous working version in place.
+- **Cap the attempts** with `set OGUN_BUILD_MAX_ATTEMPTS=5`.
+- On a slow PC or with a request the model can't manage, a build can run for a long time. Watch the console and stop it when you've seen enough.
+
 ## Configuration
 
 All optional. Set them as environment variables before running `run_ogun.bat`.
@@ -200,6 +208,8 @@ All optional. Set them as environment variables before running `run_ogun.bat`.
 | `OGUN_NUM_GPU` | - | custom layer count (`12`), or `auto` to let Ollama decide; overrides the profile |
 | `OGUN_KEEP_ALIVE` | `2m` | how long an idle model stays loaded |
 | `OGUN_UNLOAD_ON_EXIT` | `1` | set `0` to keep the model loaded after Ogun exits |
+| `OGUN_BUILD_MAX_ATTEMPTS` | `0` | `0` = plugin and tool builds retry until they pass; a number (e.g. `5`) caps them |
+| `OGUN_WEB_RESEARCH` | `0` | set `1` to let failing builds search the web (DuckDuckGo) for the error; see [Safety model](#safety-model) |
 
 Fixed generation settings (in `ogun_core/config.py`): temperature 0.1, top_p 0.95, context 8192 tokens by default (auto-tuned to 4096-16384 for your machine, see above), stop token `<|im_end|>`. They are passed on **every** model call.
 
@@ -275,17 +285,21 @@ py -3.12 tests\run_all.py
 
 | Suite | Covers |
 |---|---|
-| `tests/test_ogun_core.py` (14) | tool-call parser, security guard, plugin lifecycle and registry safety, engine loop, code tools, UTF-8 subprocess output, `/vram` and GPU profiles |
-| `tests/test_training_data.py` (21) | dataset mappers, synthetic pairs, cleaning/filters, resumable downloads, verification |
-| `tests/test_training_trainer.py` (36) | prompt rendering, TRL-version compatibility, CLI, dataset reader, dry-run |
-| `tests/test_hardware.py` (11) | hardware probe and auto-tuner |
-| `tests/test_dev_fixes.py` (149) | standalone tool builder: checks, oracles, flow analysis, arbitration, fix feedback, scripted end-to-end builds |
+| `tests/test_ogun_core.py` | tool-call parser, security guard, plugin lifecycle and registry safety, engine loop, code tools, UTF-8 subprocess output, `/vram` and GPU profiles |
+| `tests/test_training_data.py` | dataset mappers, synthetic pairs, cleaning/filters, resumable downloads, verification |
+| `tests/test_training_trainer.py` | prompt rendering, TRL-version compatibility, CLI, dataset reader, dry-run |
+| `tests/test_hardware.py` | hardware probe and auto-tuner |
+| `tests/test_dev_fixes.py` | standalone tool builder: checks, oracles, flow analysis, arbitration, fix feedback, scripted end-to-end builds |
+| `tests/test_speed_optimizations.py` | prompt and model-call speed-ups |
+| `tests/test_build_upgrade_fixes.py` | tool and plugin updates, VRAM refresh, test repair |
+| `tests/test_option_checks.py` | checks that requested tool options really work |
+| `tests/test_unlimited_builds.py` | no-limit builds, Ctrl+C stop, failure research, restarts, feedback size |
 
 ## Safety model
 
 - **Writes are confined.** The security guard resolves every path (`..`, symlinks, case, network shares, look-alike folder names) and allows AI writes only under `plugins/custom_tools/`, `plugins/tests/` and `workspace/`. Ogun's own code (`ogun_core/`), `main.py`, the launchers, `training/` and `registry.json` are off limits to the AI.
 - **Plugins run with your user's permissions.** A plugin is Python code that executes on your machine. Ogun validates and tests it before mounting, but a test cannot prove that code is harmless. Read plugins before you trust them, and don't paste prompts from sources you don't trust.
-- **Local only.** The only network use is talking to your Ollama server and, if you run the data pipeline, downloading datasets from Hugging Face.
+- **Local only.** The only network use is talking to your Ollama server and, if you run the data pipeline, downloading datasets from Hugging Face. Build research on the web is **off** unless you set `OGUN_WEB_RESEARCH=1`; when on, a failing build sends short search queries made from its error messages (e.g. `python TypeError: unsupported operand`) to DuckDuckGo.
 
 ## Project layout
 
@@ -325,12 +339,12 @@ Every path Ogun uses is resolved relative to its own folder, so you can clone or
 | The GPU runs out of memory | `/vram shared` or `/vram free`; close other GPU programs |
 | `py` is not recognised | install Python 3.12 from python.org with the "py launcher" option |
 | The launcher won't start in a folder with spaces | it quotes paths and works in folders like `C:\Users\Jane Doe\Ogun`; if it fails, re-download and check antivirus quarantine |
-| The plugin builder gives up | try again (small models are not always right the first time), or write the plugin yourself using the contract above |
+| A build keeps going without passing | press `Ctrl+C`, reword the request more simply, or write the plugin yourself using the contract above. `OGUN_BUILD_MAX_ATTEMPTS=5` makes builds give up on their own |
 
 ## Known limitations
 
 - **Windows only so far.** The launchers are `.bat` files; macOS and Linux are untested.
-- **Small local models make mistakes.** Builds can take several attempts, and some fail. Larger models do better but need more VRAM.
+- **Small local models make mistakes.** Builds can take many attempts, and some requests are beyond the model (stop those with `Ctrl+C`). Larger models do better but need more VRAM.
 - **Slow without a GPU.** CPU-only works, but replies and builds take much longer.
 - **The tool builder is best at single-file Python command-line tools** (text, CSV and JSON processing). Multi-file apps, GUIs and web servers are out of scope for now.
 - **Fine-tuning is unverified end to end.**

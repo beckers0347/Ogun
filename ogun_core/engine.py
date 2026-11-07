@@ -491,7 +491,9 @@ class CoreEngine:
         if _target and _target[0] == "workspace_tool":
             from ogun_core.standalone_builder import update_standalone_project
             try:
-                success, final_msg, details = update_standalone_project(self, _target[1], effective_user_text)
+                from ogun_core.config import BUILD_MAX_ATTEMPTS
+                success, final_msg, details = update_standalone_project(self, _target[1], effective_user_text,
+                                                                        max_attempts=BUILD_MAX_ATTEMPTS)
             except TimeoutError:
                 success, final_msg, details = False, "Model request timed out while updating the tool. Say 'continue' to retry.", {"status": "timeout"}
             self.last_turn_status = {
@@ -526,7 +528,9 @@ class CoreEngine:
             self._plugin_build_active = True
             saved_messages = list(self.messages)
             try:
-                ok, final_msg, _ = build_plugin_staged(self, self.plugin_manager, update_request, force_name=_pname)
+                from ogun_core.config import BUILD_MAX_ATTEMPTS
+                ok, final_msg, _ = build_plugin_staged(self, self.plugin_manager, update_request, force_name=_pname,
+                                                       max_attempts=BUILD_MAX_ATTEMPTS)
             except TimeoutError:
                 ok, final_msg = False, f"Model request timed out while updating the '{_pname}' plugin; it was not changed."
             finally:
@@ -546,7 +550,9 @@ class CoreEngine:
         if classify_project_request(effective_user_text) == "standalone" and clean_user not in continuation_words:
             from ogun_core.standalone_builder import build_standalone_project_staged
             try:
-                success, final_msg, details = build_standalone_project_staged(self, effective_user_text)
+                from ogun_core.config import BUILD_MAX_ATTEMPTS
+                success, final_msg, details = build_standalone_project_staged(self, effective_user_text,
+                                                                              max_attempts=BUILD_MAX_ATTEMPTS)
                 is_timeout = "timed out" in final_msg.lower() or details.get("status") == "timeout"
                 self.last_turn_status = {
                     "status": "success" if success else ("timeout" if is_timeout else "failed"),
