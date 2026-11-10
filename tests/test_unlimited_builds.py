@@ -606,12 +606,42 @@ def test_fix_prompt_shows_failing_check_and_current_code():
     assert calls == [1, 1, 1], f"history was not reset before each attempt: {calls}"
 
 
-def test_plugin_build_restarts_after_five_identical_failures():
+def test_plugin_build_restarts_after_three_identical_failures():
+    """Free-GPU target (a plugin in under 10 minutes): restart after 3 identical failures, not 5."""
     eng = _FakeEngine([PLUGIN_REPLY])
-    ok, _, _ = plb.build_plugin_staged(eng, _FakePM(succeed_on=8), "Build adder plugin", max_attempts=0)
+    ok, _, _ = plb.build_plugin_staged(eng, _FakePM(succeed_on=3), "Build adder plugin", max_attempts=0)
     assert ok
     stage1 = [p for p in eng.prompts if "Stage 1/2" in p]
     assert len(stage1) == 2, f"expected one fresh restart, got {len(stage1)} stage-1 prompts"
+
+
+def test_repeated_failures_raise_temperature_and_skip_identical_code():
+    assert plb.same_failure_streak(["a", "b", "b"]) == 2 and plb.same_failure_streak([]) == 0
+    assert plb.retry_temperature(1) == plb.FIX_TEMPERATURE < plb.retry_temperature(2) < plb.retry_temperature(3) <= 0.9
+    eng = _FakeEngine([PLUGIN_REPLY])
+    pm = _FakePM(succeed_on=0)
+    plb.build_plugin_staged(eng, pm, "Build adder plugin", max_attempts=4)
+    assert pm.calls == 2, f"identical code was re-run back to back: {pm.calls} runs in 4 attempts"
+
+
+def test_fix_reply_with_only_the_tool_keeps_the_test():
+    assert plb.is_tool_block("from x import y\nclass Adder(BaseTool):\n    pass")
+    assert not plb.is_tool_block("import sys\nfrom plugins.custom_tools.adder import Adder\nassert True")
+
+
+def test_real_engine_build_steps_skip_run_turn_and_tool_schemas():
+    from ogun_core.engine import CoreEngine
+    seen = []
+
+    class Client:
+        def chat(self, messages, tools=None, options=None):
+            seen.append((len(messages), tools, (options or {}).get("temperature")))
+            return {"content": "ok"}
+
+    eng = CoreEngine.__new__(CoreEngine)
+    eng.client = Client()
+    eng.run_turn = lambda p: (_ for _ in ()).throw(AssertionError("run_turn used"))
+    assert plb.generate(eng, "hi", 0.45) == "ok" and seen == [(1, None, 0.45)]
 
 
 def test_failed_plugin_test_is_kept_in_quarantine():
@@ -648,6 +678,28 @@ def test_plugin_test_must_cover_every_quoted_example_in_the_request():
     assert not ok and pm.calls == 0 and "'VX'" in msg, msg
 
 
+def test_quoted_parameter_names_are_not_required_test_inputs():
+    """Live: 'value' and 'direction' (parameter names in the request) were demanded as test inputs; an attempt was lost."""
+    from ogun_core import plugin_builder as pf
+    req = ("Parameters: 'value' (string) and 'direction' ('to_roman' or 'to_int'). Invalid numerals like 'IIII' "
+           "or 'VX' must return an error.")
+    code = "def execute(self, value=None, direction=None):  # to_roman / to_int"
+    test = "execute(value='IIII', direction='to_int')"
+    assert pf.request_examples_missing(req, test, code) == ["VX"]
+    assert pf.request_examples_missing(req, test) == ["to_roman", "VX"]  # without the code, names count
+
+
+def test_tool_syntax_error_shows_the_tool_line():
+    """Live: 'SyntaxError at line 17' repeated four attempts; the fix prompt never showed line 17 of the tool."""
+    from ogun_core import plugin_builder as pf
+    code = "\n".join(f"x{i} = {i}" for i in range(1, 30))
+    ctx = pf.tool_code_error_context(code, "Pre-flight code validation failed: SyntaxError at line 17: invalid syntax")
+    assert "17>> x17 = 17" in ctx and "x14 = 14" in ctx, ctx
+    tb = 'Traceback:\n  File "C:/p/plugins/custom_tools/roman.py", line 3, in execute\nKeyError'
+    assert "3>> x3 = 3" in pf.tool_code_error_context(code, tb)
+    assert pf.tool_code_error_context(code, 'File "C:/p/plugins/tests/test_roman.py", line 5') == ""
+
+
 if __name__ == "__main__":
     fails = 0
     for _name, _fn in list(globals().items()):
@@ -661,3 +713,33 @@ if __name__ == "__main__":
                 traceback.print_exc()
                 print(f"FAIL {_name}: {type(e).__name__}: {e}")
     sys.exit(1 if fails else 0)
+
+
+def test_caught_name_error_shows_where_the_name_is_used():
+    """Live: the tool caught "name 'roman_to_value' is not defined" itself (no line number); four fixes missed it."""
+    from ogun_core import plugin_builder as pf
+    code = "def a():\n    m = {1: 2}\n    return m\n\ndef b(x):\n    return m[x]\n"
+    ctx = pf.tool_code_error_context(code, "Execution failed: name 'm' is not defined")
+    assert "`m` is used where it is not defined" in ctx and "6>>     return m[x]" in ctx, ctx
+    assert ctx.count("def b(x)") == 1, "overlapping windows must merge into one listing"
+
+
+def test_plugin_test_imports_are_normalized():
+    """Measured: a correct tool failed because its test imported plugins.custom_tools.roman_numeral_tool."""
+    tool = "from ogun_core.base_tool import BaseTool\nclass RomanNumeral(BaseTool):\n    name: str = 'roman_numeral'\n"
+    test = ('"""doc"""\nfrom __future__ import annotations\n'
+            "from plugins.custom_tools.roman_numeral_tool import RomanNumeralTool\nimport sys\n"
+            "t = RomanNumeralTool()\n")
+    out = plb.normalize_plugin_test(test, tool, "roman_numeral")
+    assert "from plugins.custom_tools.roman_numeral import RomanNumeral as RomanNumeralTool" in out, out
+    lines = out.splitlines()
+    assert lines[0] == '"""doc"""' and lines[1].startswith("from __future__")
+    assert out.index("parents[2]") < out.index("from plugins.custom_tools")
+    assert plb.normalize_plugin_test(out, tool, "roman_numeral") == out      # idempotent
+
+
+def test_a_draft_gets_two_fixes_then_a_fresh_hotter_draft():
+    eng = _FakeEngine([PLUGIN_REPLY.replace("adder", f"adder{i}") for i in range(6)] + [PLUGIN_REPLY])
+    plb.build_plugin_staged(eng, _FakePM(succeed_on=0), "Build adder plugin", max_attempts=4)
+    kinds = ["draft" if "Stage 1/2" in p else "fix" for p in eng.prompts]
+    assert kinds == ["draft", "fix", "fix", "draft"], kinds

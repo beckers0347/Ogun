@@ -156,17 +156,42 @@ def set_auto_num_gpu(num_gpu):
     return True
 
 
+def get_keep_alive() -> str:
+    """Return the active Ollama keep_alive duration.
+
+    When auto-tuned in CPU-only mode without an explicit OGUN_KEEP_ALIVE override, extend keep_alive
+    to '15m' so system RAM weights and prompt prefix KV caches remain warm across turns without
+    holding any GPU VRAM.
+    """
+    if os.environ.get("OGUN_KEEP_ALIVE"):
+        return KEEP_ALIVE
+    hw = get_hardware_profile() if _ACTIVE.get("profile") == "AUTO" else None
+    if isinstance(hw, dict) and hw.get("mode") == "cpu":
+        return "15m"
+    return KEEP_ALIVE
+
+
+def get_num_batch() -> int | None:
+    """Return tuned prompt evaluation batch size for CPU/hybrid profiles (128 fits L2/L3 cache better than 512)."""
+    hw = get_hardware_profile() if _ACTIVE.get("profile") == "AUTO" else None
+    if isinstance(hw, dict) and hw.get("mode") in ("cpu", "hybrid"):
+        return int(hw.get("num_batch") or 128)
+    return None
+
+
 def llm_options(**extra):
     """The Ollama `options` payload for EVERY chat/generate call, including the ACTIVE num_gpu.
 
     Ollama reloads the model whenever load-affecting options (num_ctx, num_gpu) differ between requests, so all call
     sites must build their options here and nowhere else.
     """
+    hw = get_hardware_profile() if _ACTIVE.get("profile") == "AUTO" else None
+    is_auto_cpu = isinstance(hw, dict) and hw.get("mode") == "cpu"
     options = {
         "temperature": TEMPERATURE,
         "top_p": TOP_P,
         "num_ctx": get_num_ctx(),
-        "num_predict": NUM_PREDICT,
+        "num_predict": 2048 if is_auto_cpu else NUM_PREDICT,
         "stop": list(STOP_TOKENS),
     }
     num_gpu = get_num_gpu()
@@ -175,6 +200,9 @@ def llm_options(**extra):
     num_thread = get_num_thread()
     if num_thread:
         options["num_thread"] = num_thread
+    num_batch = get_num_batch()
+    if num_batch is not None:
+        options["num_batch"] = num_batch
     options.update(extra)
     return options
 

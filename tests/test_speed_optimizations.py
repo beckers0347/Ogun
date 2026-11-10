@@ -148,6 +148,60 @@ class TestOgunSpeedOptimizations(unittest.TestCase):
         self.assertEqual(evicted, ["llava:latest"])
         self.assertEqual(unloaded, [("llava:latest", 0)])
 
+    def test_cpu_only_model_recommendation_and_auto_configure(self):
+        from ogun_core.hardware import catalogue, recommend_model
+
+        hw_cpu_32gb = HardwareInfo(
+            os="windows",
+            arch="amd64",
+            cpu_name="AMD Ryzen 9 5900X",
+            cpu_physical=12,
+            cpu_logical=24,
+            isa={"avx": True, "avx2": True, "avx512": False, "neon": False},
+            ram_total_gb=32.0,
+            ram_available_gb=26.0,
+            gpus=[],
+            gpu=None,
+            probe_seconds=0.01,
+            notes=[],
+        )
+        # CPU-only machine with 32 GB RAM recommends 7b for speed instead of 14b
+        rec = recommend_model(hw_cpu_32gb)
+        self.assertEqual(rec.tag, "qwen2.5-coder:7b")
+
+        # auto_configure clamps num_ctx to 4096 in CPU-only mode and auto-selects installed 7b over 14b
+        cat = {m.tag: m for m in catalogue()}
+        installed = [cat["qwen2.5-coder:14b"], cat["qwen2.5-coder:7b"]]
+        prof = auto_configure(hw_cpu_32gb, installed=installed)
+        self.assertEqual(prof.mode, "cpu")
+        self.assertEqual(prof.num_ctx, 4096)
+        self.assertEqual(prof.model_tag, "qwen2.5-coder:7b")
+        self.assertTrue(any("CPU-only mode: automatically selected faster installed model" in w for w in prof.warnings))
+
+    def test_cpu_only_runtime_options_and_keep_alive(self):
+        from ogun_core import config as cfg
+
+        saved = dict(cfg._ACTIVE)
+        try:
+            cfg.apply_hardware_profile({
+                "mode": "cpu",
+                "num_ctx": 4096,
+                "num_gpu": 0,
+                "num_thread": 12,
+                "model_tag": "qwen2.5-coder:7b",
+            })
+            opts = cfg.llm_options()
+            self.assertEqual(opts["num_ctx"], 4096)
+            self.assertEqual(opts["num_gpu"], 0)
+            self.assertEqual(opts["num_batch"], 128)
+            self.assertEqual(opts["num_predict"], 2048)
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("OGUN_KEEP_ALIVE", None)
+                self.assertEqual(cfg.get_keep_alive(), "15m")
+        finally:
+            cfg._ACTIVE.clear()
+            cfg._ACTIVE.update(saved)
+
 
 if __name__ == "__main__":
     unittest.main()

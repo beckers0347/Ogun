@@ -6,10 +6,10 @@ until the plugin passes its test or the user presses Ctrl+C.
 """
 from __future__ import annotations
 
+import ast
 import re
 from typing import Any, List, Optional, Tuple
 
-from ogun_core.config import PLUGIN_BUILDER_PROMPT
 from ogun_core.engine import CoreEngine
 from ogun_core.plugin_manager import PluginManager
 from ogun_core.quality import check_requirements_coverage, fit_feedback, research_build_failure
@@ -49,7 +49,173 @@ def _research_plugin_failure(engine: CoreEngine, request_text: str, last_error: 
         return ""
 
 
-RESTART_AFTER_SAME_FAILURES = 5
+# Live 2026-11-09 (free GPU target: a plugin in under 10 minutes): 5 identical failures before a restart wasted
+# attempts that all failed the same way; 3 is enough to tell the code is stuck.
+RESTART_AFTER_SAME_FAILURES = 3
+STAGE_MAX_TOKENS = 3072
+BASE_TEMPERATURE = 0.2
+# Measured 2026-11-09 on the Roman-numeral request (27 sampled fix replies, 25 sampled first drafts): fixes of a draft
+# whose logic is wrong almost never pass (0/27), while fresh drafts pass about one time in five. So a draft gets at most
+# MAX_FIXES_PER_DRAFT fixes, then a fresh draft is written at a higher temperature so it differs from the last one.
+MAX_FIXES_PER_DRAFT = 2
+FRESH_DRAFT_TEMPERATURE = 0.7
+FIX_TEMPERATURE = 0.3
+
+# Short build prompt (the long PLUGIN_BUILDER_PROMPT with its template made replies ~35% longer with no better pass rate
+# in the same measurement). Every step's prompt starts with it.
+STAGED_PROMPT = """You write a plugin tool for Ogun, a local assistant (Windows, Python 3.12).
+
+TOOL (saved as plugins/custom_tools/<name>.py)
+- `from ogun_core.base_tool import BaseTool, ToolResult`; one class inheriting BaseTool with class attributes `name` (snake_case str), `version` = "1.0.0", `description`, `parameters_schema` (JSON Schema dict).
+- `def execute(self, **kwargs) -> ToolResult`; read parameters with kwargs.get(). Return `ToolResult.success(output=...)` or `ToolResult.error(error_trace="...")`; never raise.
+- Real standard-library logic, no stubs or TODOs. An empty string is a value: test parameters with `is None`, never `if not value`.
+- Stream large files in chunks; catch OSError and return it as an error result.
+
+TEST (saved as plugins/tests/test_<name>.py, run as a script, no pytest)
+- First lines: `import sys`, `from pathlib import Path`, `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))`; only then `from plugins.custom_tools.<name> import <the class the tool defines>`.
+- Cases as (kwargs, expected) pairs checked in one loop. For a case that must fail, check only `res.status == "error"`, never the message text. Use only expected values the request states or that you compute with code; never hand-calculate checksums, hashes or other numbers.
+- Check every example value the request quotes, valid and invalid, each as its own case.
+- Every assertion message names the input and the actual result. Print "PASS" and exit 0; on the first failure print the message to stderr and exit 1.
+"""
+
+
+_BOOT = ("import sys as _plugin_test_sys\nfrom pathlib import Path as _PluginTestPath\n"
+         "_plugin_test_sys.path.insert(0, str(_PluginTestPath(__file__).resolve().parents[2]))\n")
+
+
+def _tool_class(tool_code: str):
+    try:
+        tree = ast.parse(tool_code)
+    except SyntaxError:
+        m = re.search(r"^class\s+(\w+)\s*\([^)]*BaseTool", tool_code or "", re.M)
+        return m.group(1) if m else None, set()
+    names = {n.name for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
+    names |= {t.id for n in tree.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
+    for n in tree.body:
+        if isinstance(n, ast.ClassDef) and any("BaseTool" in ast.unparse(b) for b in n.bases):
+            return n.name, names
+    return None, names
+
+
+def normalize_plugin_test(test_code: str, tool_code: str, module_name: str) -> str:
+    if not test_code or not module_name:
+        return test_code
+    cls, defined = _tool_class(tool_code)
+
+    def fix_from(m):
+        names = m.group(2)
+        if cls:
+            parts = [p.strip() for p in names.split(",")]
+            fixed = []
+            for p in parts:
+                base, _, alias = p.partition(" as ")
+                base = base.strip()
+                if base and base not in defined and base[:1].isupper():
+                    alias = alias.strip() or base      # keep the name the test uses
+                    p = f"{cls} as {alias}" if alias != cls else cls
+                fixed.append(p)
+            names = ", ".join(fixed)
+        return f"from plugins.custom_tools.{module_name} import {names}"
+
+    out = re.sub(r"from\s+plugins\.custom_tools\.(\w+)\s+import\s+([^\n(]+)", fix_from, test_code)
+    out = re.sub(r"import\s+plugins\.custom_tools\.(\w+)", f"import plugins.custom_tools.{module_name}", out)
+    out = re.sub(r"plugins\.custom_tools\.(?!" + re.escape(module_name) + r"\b)(\w+)\.(\w+)",
+                 lambda m: f"plugins.custom_tools.{module_name}.{m.group(2)}", out)
+    if "_plugin_test_sys" not in out:
+        lines = out.splitlines(keepends=True)
+        at = 0
+        # keep a module docstring and `from __future__` imports first
+        try:
+            tree = ast.parse(out)
+            for n in tree.body:
+                if (isinstance(n, ast.Expr) and isinstance(getattr(n, "value", None), ast.Constant)
+                        and isinstance(n.value.value, str)) or (isinstance(n, ast.ImportFrom) and n.module == "__future__"):
+                    at = n.end_lineno
+                else:
+                    break
+        except SyntaxError:
+            pass
+        out = "".join(lines[:at]) + _BOOT + "".join(lines[at:])
+    return out
+
+
+def generate(engine: Any, prompt: str, temperature: float = BASE_TEMPERATURE) -> str:
+    """One fresh model call: the prompt alone, no chat history, no tool schemas.
+
+    Live 2026-11-09: every build step went through run_turn (system prompt, every tool schema, the honesty check and
+    possible tool rounds) although the builder only needs two code blocks back. Test doubles without a real engine
+    still go through run_turn.
+    """
+    client = getattr(engine, "client", None)
+    if isinstance(engine, CoreEngine) and client is not None and hasattr(client, "chat"):
+        msgs = [{"role": "user", "content": prompt}]
+        try:
+            r = client.chat(msgs, tools=None, options={"num_predict": STAGE_MAX_TOKENS, "temperature": temperature})
+        except TypeError:
+            r = client.chat(msgs, tools=None)
+        return (r or {}).get("content", "") or ""
+    return engine.run_turn(prompt)
+
+
+def same_failure_streak(errors: List[str]) -> int:
+    """How many of the latest failures in a row are the same failure (0 when there is none)."""
+    n = 0
+    for e in reversed(errors):
+        if e != errors[-1]:
+            break
+        n += 1
+    return n
+
+
+def retry_temperature(streak: int) -> float:
+    """Low temperature first; each repeat of the same failure samples more widely so the next fix differs."""
+    return FIX_TEMPERATURE if streak <= 1 else min(FIX_TEMPERATURE + 0.25 * (streak - 1), 0.9)
+
+
+def is_tool_block(code: str) -> bool:
+    """A fix reply with one block: is it the tool (defines the BaseTool class) or the test?"""
+    return bool(re.search(r"^\s*class\s+\w+\s*\([^)]*BaseTool", code or "", re.M))
+
+
+STUCK_NOTE = ("The previous fix produced this SAME failure again, so the current approach to this case does not work. "
+              "Do not patch it: rewrite the logic that decides this case with a different method.")
+
+
+def tool_code_error_context(tool_code: str, error: str) -> str:
+    """The tool-code lines a syntax error or traceback points at (>> marks the line).
+
+    Live: "SyntaxError at line 17: invalid syntax" came back four attempts running; the fix prompt showed the test's
+    lines but never line 17 of the tool, so the model could not see what to fix.
+    """
+    if not tool_code or not error:
+        return ""
+    lines = tool_code.splitlines()
+    spots: List[int] = []
+    if "test_" not in error.split("SyntaxError at line")[0][-200:]:
+        spots += [int(n) - 1 for n in re.findall(r"SyntaxError at line (\d+)", error)]
+    spots += [int(n) - 1 for n in re.findall(r'File "[^"]*custom_tools[^"]*\.py", line (\d+)', error)]
+    # A NameError the tool caught itself has no line number ("Execution failed: name 'x' is not defined"). Live: four
+    # attempts in a row could not find it; show where the name is used.
+    undefined = re.findall(r"name '([A-Za-z_]\w*)' is not defined", error)
+    for nm in undefined[:1]:
+        spots += [i for i, ln in enumerate(lines) if re.search(rf"\b{re.escape(nm)}\b", ln)][:3]
+    marked = sorted({i for i in spots if 0 <= i < len(lines)})[:3]
+    windows: List[List[int]] = []          # overlapping windows merge into one listing with several >> marks
+    for i in marked:
+        lo, hi = max(0, i - 4), min(len(lines), i + 3)
+        if windows and lo <= windows[-1][1]:
+            windows[-1][1] = max(windows[-1][1], hi)
+        else:
+            windows.append([lo, hi])
+    blocks = ["\n".join(f"{n + 1:4d}{'>>' if n in marked else '  '} {lines[n]}" for n in range(lo, hi))
+              for lo, hi in windows]
+    if not blocks:
+        return ""
+    head = "THE FAILING LINE IN THE TOOL CODE (>> marks it):\n"
+    if undefined:
+        head = (f"`{undefined[0]}` is used where it is not defined (a name defined inside one function or method is "
+                f"not visible in another). Where `{undefined[0]}` appears in the tool code (>> marks it):\n")
+    return head + "\n...\n".join(blocks)
 
 
 def failing_check_context(test_code: str, error: str, max_spots: int = 3) -> str:
@@ -94,7 +260,19 @@ def failing_check_context(test_code: str, error: str, max_spots: int = 3) -> str
 _QUOTED_RE = re.compile(r"(?<![\w'\"`])(?:'([^'\n]{1,40})'|\"([^\"\n]{1,40})\"|`([^`\n]{1,40})`)(?![\w'\"`])")
 
 
-def request_examples_missing(request_text: str, test_code: str) -> List[str]:
+_NAME_RE = re.compile(r"[a-z][a-z0-9_]*")
+
+
+def _is_code_name(value: str, tool_code: str) -> bool:
+    """A quoted snake_case word that the tool's own code uses is a parameter or option name, not a test input.
+
+    Live: "Parameters: 'value' (string) and 'direction' ('to_roman' or 'to_int')" made the check demand a test for
+    'value' and 'direction', and a whole attempt was lost. Upper-case inputs like 'IIII' or 'VX' are never skipped.
+    """
+    return bool(tool_code) and bool(_NAME_RE.fullmatch(value)) and value in tool_code
+
+
+def request_examples_missing(request_text: str, test_code: str, tool_code: str = "") -> List[str]:
     """Quoted example values in the request that the test never uses.
 
     Live bug: the request said invalid numerals "like 'IIII' or 'VX'" must be errors; the model's test only tried
@@ -106,7 +284,8 @@ def request_examples_missing(request_text: str, test_code: str) -> List[str]:
     missing: List[str] = []
     for m in _QUOTED_RE.finditer(text):
         value = next(g for g in m.groups() if g is not None)
-        if value.strip() and value not in (test_code or "") and value not in missing:
+        if (value.strip() and value not in (test_code or "") and value not in missing
+                and not _is_code_name(value, tool_code)):
             missing.append(value)
     return missing
 
@@ -141,6 +320,11 @@ def build_plugin_staged(
     have_stage1 = False
     errors_seen: List[str] = []
     research_notes = ""
+    restarted = False
+    last_submitted: List[Tuple[str, str]] = []   # the last run's code, as written and as normalized
+    skipped_same = False
+    fixes_on_draft = 0
+    trace = _Trace()
 
     if unbounded:
         print("[Ogun Plugin Builder] No attempt limit: fixing until the plugin passes its test. Ctrl+C stops it.",
@@ -158,104 +342,135 @@ def build_plugin_staged(
     try:
         while unbounded or attempt < max_attempts:
             attempt += 1
-            # Same failure RESTART_AFTER_SAME_FAILURES times in a row: the code is stuck, write it again from scratch.
-            tail = errors_seen[-RESTART_AFTER_SAME_FAILURES:]
-            if (have_stage1 and len(tail) == RESTART_AFTER_SAME_FAILURES and len(set(tail)) == 1
-                    and (attempt - 1) % RESTART_AFTER_SAME_FAILURES == 0):
-                print(f"[Ogun Plugin Builder] Same failure {RESTART_AFTER_SAME_FAILURES} times in a row: "
+            trace.start(attempt)
+            # A draft that still fails after MAX_FIXES_PER_DRAFT fixes is replaced by a fresh one (see the constant).
+            if have_stage1 and fixes_on_draft >= MAX_FIXES_PER_DRAFT:
+                print(f"[Ogun Plugin Builder] {MAX_FIXES_PER_DRAFT} fixes did not make this draft pass: "
                       "starting the plugin over from scratch.", flush=True)
                 have_stage1, tool_code, test_code = False, "", ""
+                restarted = True
             # No limit: research the first time an error repeats, and every third attempt.
             first_repeat = (len(errors_seen) >= 2 and errors_seen[-1] == errors_seen[-2]
                             and (len(errors_seen) < 3 or errors_seen[-3] != errors_seen[-1]))
             if unbounded and attempt > 1 and (first_repeat or (attempt - 1) % 3 == 0):
                 print(f"[Ogun Plugin Builder] Researching the failure before attempt {attempt}...", flush=True)
                 research_notes = _research_plugin_failure(engine, request_text, last_error, tool_code) or research_notes
+                trace.mark("research")
+            streak = same_failure_streak(errors_seen) if have_stage1 else 0
+            temperature = (retry_temperature(streak) if have_stage1
+                           else (FRESH_DRAFT_TEMPERATURE if restarted else BASE_TEMPERATURE))
             try:
                 if not have_stage1:
-                    # Stage 1: Request tool implementation
+                    fixes_on_draft = 0
+                    # Stage 1: the tool and its test in one reply.
                     stage1_prompt = (
-                        f"{PLUGIN_BUILDER_PROMPT}\n\n"
-                        f"Stage 1/2: Author the complete Python tool class for this plugin request:\n{request_text}\n"
-                        "Provide the tool code in a fenced ```python code block."
+                        f"{STAGED_PROMPT}\n"
+                        f"Stage 1/2: Author the complete Python tool class AND its unit test for this plugin request:\n"
+                        f"{request_text}\n"
+                        "Output two fenced ```python code blocks: the tool, then the test."
                     )
                     if research_notes:
                         stage1_prompt += f"\n\n{research_notes}"
                     _fresh_history()
-                    reply1 = engine.run_turn(stage1_prompt)
+                    reply1 = generate(engine, stage1_prompt, temperature)
                     blocks1 = parse_code_blocks(reply1)
 
                     if len(blocks1) >= 2:
-                        # Model provided both tool and test in stage 1
                         tool_code, test_code = blocks1[0], blocks1[1]
                         have_stage1 = True
                     elif len(blocks1) == 1:
                         tool_code = blocks1[0]
                         have_stage1 = True
-                        # Stage 2: Request unit tests
+                        # Stage 2: the test for the tool just written (the prompt carries the tool; no history).
                         stage2_prompt = (
-                            "Stage 2/2: Author the standalone unit test for the tool class above.\n"
+                            f"{STAGED_PROMPT}\n"
+                            f"Stage 2/2: Author the standalone unit test for this tool.\n"
+                            f"=== PLUGIN REQUEST ===\n{request_text}\n"
+                            f"=== TOOL CODE ===\n```python\n{tool_code}\n```\n"
                             "Requirements: Standalone runnable via `python plugins/tests/test_<name>.py` "
                             "(imports the tool, asserts real behavior, exits 0 on success).\n"
                             "Provide the test code in a single fenced ```python code block."
                         )
-                        reply2 = engine.run_turn(stage2_prompt)
-                        blocks2 = parse_code_blocks(reply2)
+                        _fresh_history()
+                        blocks2 = parse_code_blocks(generate(engine, stage2_prompt, temperature))
                         if blocks2:
                             test_code = blocks2[0]
                     else:
                         last_error = "Model generated no fenced python code blocks in Stage 1."
                         _note_failure(errors_seen, attempt, of_total, last_error)
+                        trace.end("no_blocks", last_error, tool_code, test_code)
                         continue
                 else:
+                    fixes_on_draft += 1
                     # Self-correction: Feed real failure/error output back into next attempt
                     where = failing_check_context(test_code, last_error)
+                    code_where = tool_code_error_context(tool_code, last_error)
+                    if code_where:
+                        where = (where + "\n" if where else "") + code_where
                     correction_prompt = (
-                        f"{PLUGIN_BUILDER_PROMPT}\n\n"
+                        f"{STAGED_PROMPT}\n"
                         f"Attempt {attempt}{of_total} - this plugin FAILED verification.\n"
                         f"=== PLUGIN REQUEST ===\n{request_text}\n"
                         f"=== CURRENT TOOL CODE ===\n```python\n{tool_code}\n```\n"
                         f"=== CURRENT TEST CODE ===\n```python\n{test_code}\n```\n"
                         f"=== FAILURE ===\n{fit_feedback(last_error, 2500)}\n"
                         + (f"{where}\n" if where else "")
+                        + (f"{STUCK_NOTE}\n" if streak >= 2 else "")
                         + (f"{fit_feedback(research_notes, 1500)}\n" if research_notes else "")
                         + "=== HOW TO FIX ===\n"
                         "Find the failing check above and the input it uses. If that check matches the plugin "
                         "request, the TOOL is wrong: change the tool so it handles that input. Only change the test "
                         "if it contradicts the request. Resubmitting the same tool code will fail the same way.\n"
-                        "Output exactly two fenced ```python code blocks:\n"
-                        "1. The corrected tool implementation.\n"
-                        "2. The corrected unit test (every assertion message names the input and the actual result)."
+                        "Output the corrected tool in a fenced ```python block. If the test must change too, add the "
+                        "complete corrected unit test as a second block (every assertion message names the input and "
+                        "the actual result); if the test is right, output only the tool."
                     )
                     _fresh_history()
-                    fix_reply = engine.run_turn(correction_prompt)
+                    fix_reply = generate(engine, correction_prompt, temperature)
                     blocks = parse_code_blocks(fix_reply)
                     if len(blocks) >= 2:
                         tool_code, test_code = blocks[0], blocks[1]
                     elif len(blocks) == 1:
-                        tool_code = blocks[0]
+                        if is_tool_block(blocks[0]) or not is_tool_block(tool_code):
+                            tool_code = blocks[0]
+                        else:
+                            test_code = blocks[0]
             except TimeoutError as exc:
                 if not unbounded:
                     raise
                 last_error = f"Model request timed out: {exc}"
                 _note_failure(errors_seen, attempt, of_total, last_error)
+                trace.end("timeout", last_error, tool_code, test_code)
                 continue
+            trace.mark("generate")
 
             if not tool_code or not test_code:
                 last_error = (
                     f"Expected 2 code blocks (tool and test), got tool={bool(tool_code)}, test={bool(test_code)}."
                 )
                 _note_failure(errors_seen, attempt, of_total, last_error)
+                trace.end("missing_block", last_error, tool_code, test_code)
+                continue
+
+            # The same code again cannot pass: count it as the same failure (raising the temperature) without a run.
+            # Only once in a row, so a model that keeps repeating itself still gets its code run (and a fake can't loop).
+            if (tool_code, test_code) in last_submitted and not skipped_same:
+                skipped_same = True
+                errors_seen.append(last_error)
+                print(f"[Ogun Plugin Builder] Attempt {attempt}{of_total} returned the same code again; "
+                      "retrying with more variation.", flush=True)
+                trace.end("same_code", last_error, tool_code, test_code)
                 continue
 
             # The test must try every example the request quotes (they are the user's own acceptance cases).
-            untested = request_examples_missing(request_text, test_code)
+            untested = request_examples_missing(request_text, test_code, tool_code)
             if untested:
                 last_error = ("The unit test never checks these examples from the plugin request: "
                               + ", ".join(repr(v) for v in untested)
                               + ". Add a check for EACH one with the result the request gives for it (a value it "
                               "converts to, or an error result), then make the tool pass those checks.")
                 _note_failure(errors_seen, attempt, of_total, last_error)
+                trace.end("examples", last_error, tool_code, test_code)
                 continue
 
             # Static requirements-coverage check
@@ -263,6 +478,7 @@ def build_plugin_staged(
             if not covered:
                 last_error = f"Static requirements coverage check failed: {'; '.join(missing)}"
                 _note_failure(errors_seen, attempt, of_total, last_error)
+                trace.end("coverage", last_error, tool_code, test_code)
                 continue
 
             # Extract plugin name
@@ -271,9 +487,17 @@ def build_plugin_staged(
             if force_name:
                 plugin_name = force_name   # an update must replace the existing plugin, never create a differently named one
 
+            # Mechanical test mistakes (wrong module or class name in the import, imports above the path setup) cost
+            # whole attempts in the measurement above; fix them instead of asking the model.
+            written = (tool_code, test_code)
+            test_code = normalize_plugin_test(test_code, tool_code, plugin_name)
+
             # Attempt creation and isolated subprocess testing
+            last_submitted, skipped_same = [written, (tool_code, test_code)], False
             res = plugin_manager.create_or_update_plugin(plugin_name, tool_code, test_code)
+            trace.mark("install_and_test")
             if res.status == "success":
+                trace.end("pass", "", tool_code, test_code)
                 return (
                     True,
                     f"[PASS] Plugin '{plugin_name}' successfully built, tested, and mounted on attempt {attempt}.",
@@ -281,6 +505,7 @@ def build_plugin_staged(
                 )
             last_error = res.error_trace or "Subprocess unit test execution failed."
             _note_failure(errors_seen, attempt, of_total, last_error)
+            trace.end("test_failed", last_error, tool_code, test_code)
     except KeyboardInterrupt:
         return (
             False,
@@ -293,3 +518,34 @@ def build_plugin_staged(
         f"[FAIL] Plugin creation failed after {max_attempts} attempts. Last error: {last_error}",
         plugin_name,
     )
+
+
+class _Trace:
+    """Per-attempt timings and full failures as JSON lines, when OGUN_BUILD_TRACE names a file (off by default)."""
+
+    def __init__(self) -> None:
+        import os
+        self.path = os.environ.get("OGUN_BUILD_TRACE", "").strip()
+        self.rec: dict = {}
+
+    def start(self, attempt: int) -> None:
+        import time
+        self.t = time.time()
+        self.rec = {"attempt": attempt, "phases": {}}
+
+    def mark(self, phase: str) -> None:
+        import time
+        now = time.time()
+        self.rec.setdefault("phases", {})[phase] = round(now - self.t, 2)
+        self.t = now
+
+    def end(self, outcome: str, error: str, tool_code: str, test_code: str) -> None:
+        if not self.path:
+            return
+        import json
+        self.rec.update(outcome=outcome, error=error, tool_code=tool_code, test_code=test_code)
+        try:
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(self.rec) + "\n")
+        except OSError:
+            pass

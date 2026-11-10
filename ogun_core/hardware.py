@@ -878,6 +878,12 @@ def recommend_model(hw: HardwareInfo) -> ModelSpec:
     vram_free = hw.gpu.vram_free_gb if hw.gpu else 0.0
     vram_tot = round(hw.gpu.vram_total_gb, 0) if hw.gpu else 0.0
 
+    # CPU-only hosts: memory bandwidth caps token generation (~7-10 tok/s on 7B vs ~3 tok/s on 14B/32B)
+    if hw.gpu is None or hw.gpu.vendor == "none" or vram_tot <= 0.0:
+        if hw.ram_total_gb <= 8.0 or hw.ram_available_gb < 6.0:
+            return cat["qwen2.5-coder:3b"]
+        return cat["qwen2.5-coder:7b"]
+
     if tier == "high":
         if vram_tot >= 24.0 and vram_free >= 20.0:
             return cat.get("qwen2.5-coder:32b-q6") or cat["qwen2.5-coder:32b"]
@@ -956,10 +962,16 @@ def auto_configure(
         reserve_gb = 0.5
 
     # 3. Context window tuning (default 8192, 4096 <= num_ctx <= 16384, step 1024)
+    force_cpu = bool(overrides.get("force_cpu"))
+    has_gpu = (hw.gpu is not None) and (hw.gpu.vendor != "none") and not force_cpu
+
     if "ctx" in overrides:
         num_ctx = int(overrides["ctx"])
     elif target_ctx is not None:
         num_ctx = target_ctx
+    elif not has_gpu:
+        # CPU-only mode: keep context compact (4096) to avoid quadratic prompt prefill slowdown in system RAM
+        num_ctx = 4096
     else:
         num_ctx = 8192
         # Scale DOWN to 4096 if RAM headroom < 3 GB after weights on CPU
@@ -988,8 +1000,6 @@ def auto_configure(
     kv_total_gb = _estimate_kv_cache_gb(model.blocks, model.head_count_kv, model.head_dim, num_ctx, kv_cache_type=kv_cache_type)
 
     # 5. Layer offloading math
-    force_cpu = bool(overrides.get("force_cpu"))
-    has_gpu = (hw.gpu is not None) and (hw.gpu.vendor != "none") and not force_cpu
 
     if not has_gpu:
         vram_budget = 0.0
@@ -1100,6 +1110,40 @@ def auto_configure(
             if cand_prof.fits:
                 cand_warnings = [
                     f"Configured model '{model.tag}' does not fit available memory; automatically selected installed model '{inst.tag}' for this run."
+                ]
+                cand_warnings.extend(cand_prof.warnings)
+                return ExecutionProfile(
+                    tier=cand_prof.tier,
+                    mode=cand_prof.mode,
+                    model_tag=cand_prof.model_tag,
+                    quant=cand_prof.quant,
+                    num_gpu=cand_prof.num_gpu,
+                    gpu_units=cand_prof.gpu_units,
+                    total_units=cand_prof.total_units,
+                    num_ctx=cand_prof.num_ctx,
+                    num_thread=cand_prof.num_thread,
+                    reserve_gb=cand_prof.reserve_gb,
+                    est_vram_gb=cand_prof.est_vram_gb,
+                    est_ram_gb=cand_prof.est_ram_gb,
+                    fits=cand_prof.fits,
+                    warnings=cand_warnings,
+                    source=cand_prof.source,
+                )
+
+    # CPU-only speed optimization: if running on CPU with a large model (> 5.5 GB, e.g. 14B/32B)
+    # and the user did not explicitly force --model, prefer an installed <= 5.5 GB model (e.g. 7B/3B)
+    # for 2-3x faster CPU token generation.
+    if mode == "cpu" and model.file_gb > 5.5 and "model" not in overrides and installed:
+        fast_cpu_installed = sorted(
+            [m for m in installed if m.file_gb <= 5.5],
+            key=lambda m: m.file_gb,
+            reverse=True,
+        )
+        for inst in fast_cpu_installed:
+            cand_prof = auto_configure(hw, model=inst, installed=None, overrides=overrides, target_ctx=target_ctx)
+            if cand_prof.fits:
+                cand_warnings = [
+                    f"CPU-only mode: automatically selected faster installed model '{inst.tag}' instead of '{model.tag}' for 2-3x higher CPU throughput."
                 ]
                 cand_warnings.extend(cand_prof.warnings)
                 return ExecutionProfile(

@@ -39,6 +39,10 @@ REM 3. Execution Environment
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONPATH=%~dp0"
+if not defined OLLAMA_FLASH_ATTENTION set "OLLAMA_FLASH_ATTENTION=1"
+if not defined OLLAMA_KV_CACHE_TYPE set "OLLAMA_KV_CACHE_TYPE=q8_0"
+if not defined OLLAMA_NUM_PARALLEL set "OLLAMA_NUM_PARALLEL=1"
+if not defined OLLAMA_MAX_LOADED_MODELS set "OLLAMA_MAX_LOADED_MODELS=1"
 
 ".venv\Scripts\python.exe" main.py %*
 set "EXITCODE=%errorlevel%"

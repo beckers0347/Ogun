@@ -36,6 +36,7 @@ from ogun_core.config import (
     VRAM_PROFILES,
     apply_hardware_profile,
     get_hardware_profile,
+    get_keep_alive,
     get_num_ctx,
     get_num_gpu,
     get_num_thread,
@@ -223,6 +224,7 @@ class OllamaClient:
         use_stream = bool(stream or on_token is not None)
 
         # Try official ollama package first
+        eff_keep_alive = get_keep_alive()
         try:
             import ollama
 
@@ -231,7 +233,7 @@ class OllamaClient:
                 "model": self.model,
                 "messages": messages,
                 "options": options,
-                "keep_alive": KEEP_ALIVE,
+                "keep_alive": eff_keep_alive,
             }
             if tools:
                 kwargs["tools"] = tools
@@ -274,7 +276,7 @@ class OllamaClient:
             "model": self.model,
             "messages": messages,
             "options": options,
-            "keep_alive": KEEP_ALIVE,
+            "keep_alive": eff_keep_alive,
             "stream": False,
         }
         if tools:
