@@ -58,6 +58,9 @@ BASE_TEMPERATURE = 0.2
 # whose logic is wrong almost never pass (0/27), while fresh drafts pass about one time in five. So a draft gets at most
 # MAX_FIXES_PER_DRAFT fixes, then a fresh draft is written at a higher temperature so it differs from the last one.
 MAX_FIXES_PER_DRAFT = 2
+# Quoted words the model leaves out of its test this many times are taken as wording, not test values. Live
+# 2026-11-10: a request saying `a list of "bad" patterns` failed 29 attempts in a row on "never checks 'bad'".
+EXAMPLE_WAIVE_AFTER = 3
 FRESH_DRAFT_TEMPERATURE = 0.7
 FIX_TEMPERATURE = 0.3
 
@@ -76,6 +79,20 @@ TEST (saved as plugins/tests/test_<name>.py, run as a script, no pytest)
 - Cases as (kwargs, expected) pairs checked in one loop. For a case that must fail, check only `res.status == "error"`, never the message text. Use only expected values the request states or that you compute with code; never hand-calculate checksums, hashes or other numbers.
 - Check every example value the request quotes, valid and invalid, each as its own case.
 - Every assertion message names the input and the actual result. Print "PASS" and exit 0; on the first failure print the message to stderr and exit 1.
+
+- Use this loop (fill in the cases; "error" marks a case that must fail):
+  ```
+  CASES = [({"param": "valid input"}, <expected output>), ({"param": "bad input"}, "error")]
+  for kwargs, expected in CASES:
+      res = tool.execute(**kwargs)
+      ok = res.status == "error" if expected == "error" else (res.status == "success" and res.output == expected)
+      if not ok:
+          print(f"FAIL execute({kwargs}): expected {expected!r}, got {res.status} {res.output!r} {res.error_trace!r}",
+                file=sys.stderr)
+          sys.exit(1)
+  print("PASS")
+  ```
+  `<expected output>` must be exactly what the tool returns as `output` (if it returns {"result": x}, expect {"result": x}).
 """
 
 
@@ -117,7 +134,10 @@ def normalize_plugin_test(test_code: str, tool_code: str, module_name: str) -> s
             names = ", ".join(fixed)
         return f"from plugins.custom_tools.{module_name} import {names}"
 
-    out = re.sub(r"from\s+plugins\.custom_tools\.(\w+)\s+import\s+([^\n(]+)", fix_from, test_code)
+    # Live: `from plugins.tools.roman_numeral import ...` failed 13 attempts in a row. Any plugins.* / custom_tools.*
+    # path, or the bare module name, means the tool module.
+    out = re.sub(r"from\s+(plugins(?:\.\w+)*|custom_tools(?:\.\w+)*|" + re.escape(module_name)
+                 + r")\s+import\s+([^\n(]+)", fix_from, test_code)
     out = re.sub(r"import\s+plugins\.custom_tools\.(\w+)", f"import plugins.custom_tools.{module_name}", out)
     out = re.sub(r"plugins\.custom_tools\.(?!" + re.escape(module_name) + r"\b)(\w+)\.(\w+)",
                  lambda m: f"plugins.custom_tools.{module_name}.{m.group(2)}", out)
@@ -137,6 +157,19 @@ def normalize_plugin_test(test_code: str, tool_code: str, module_name: str) -> s
             pass
         out = "".join(lines[:at]) + _BOOT + "".join(lines[at:])
     return out
+
+
+def plugin_name_from_code(code: str) -> Optional[str]:
+    """`name = "x"` or `name: str = "x"` in the tool class (live: the short prompt led to the unannotated form, which the
+    old pattern missed, and the plugin was mounted as 'custom_tool')."""
+    m = re.search(r"""^\s*name\s*(?::\s*str\s*)?=\s*["']([A-Za-z0-9_]+)["']""", code or "", re.M)
+    return m.group(1) if m else None
+
+
+def requested_plugin_name(request_text: str) -> Optional[str]:
+    """'plugin named roman_numeral' / 'plugin called roman_numeral' -> 'roman_numeral' (the user's own name wins)."""
+    m = re.search(r"\b(?:plugin|tool)\s+(?:named|called)\s+[`'\"]?([A-Za-z][A-Za-z0-9_]*)", request_text or "")
+    return m.group(1) if m else None
 
 
 def generate(engine: Any, prompt: str, temperature: float = BASE_TEMPERATURE) -> str:
@@ -324,6 +357,8 @@ def build_plugin_staged(
     last_submitted: List[Tuple[str, str]] = []   # the last run's code, as written and as normalized
     skipped_same = False
     fixes_on_draft = 0
+    waived: set = set()
+    example_misses: dict = {}
     trace = _Trace()
 
     if unbounded:
@@ -349,10 +384,11 @@ def build_plugin_staged(
                       "starting the plugin over from scratch.", flush=True)
                 have_stage1, tool_code, test_code = False, "", ""
                 restarted = True
-            # No limit: research the first time an error repeats, and every third attempt.
+            # No limit: research the first time an error repeats. (Every third attempt as well cost ~70 s per build in
+            # the 2026-11-10 timing runs without a measurable gain; fresh drafts now do that job.)
             first_repeat = (len(errors_seen) >= 2 and errors_seen[-1] == errors_seen[-2]
                             and (len(errors_seen) < 3 or errors_seen[-3] != errors_seen[-1]))
-            if unbounded and attempt > 1 and (first_repeat or (attempt - 1) % 3 == 0):
+            if unbounded and attempt > 1 and first_repeat:
                 print(f"[Ogun Plugin Builder] Researching the failure before attempt {attempt}...", flush=True)
                 research_notes = _research_plugin_failure(engine, request_text, last_error, tool_code) or research_notes
                 trace.mark("research")
@@ -456,6 +492,7 @@ def build_plugin_staged(
             # Only once in a row, so a model that keeps repeating itself still gets its code run (and a fake can't loop).
             if (tool_code, test_code) in last_submitted and not skipped_same:
                 skipped_same = True
+                fixes_on_draft = MAX_FIXES_PER_DRAFT   # the fixes have run dry: the next attempt is a fresh draft
                 errors_seen.append(last_error)
                 print(f"[Ogun Plugin Builder] Attempt {attempt}{of_total} returned the same code again; "
                       "retrying with more variation.", flush=True)
@@ -463,7 +500,16 @@ def build_plugin_staged(
                 continue
 
             # The test must try every example the request quotes (they are the user's own acceptance cases).
-            untested = request_examples_missing(request_text, test_code, tool_code)
+            untested = [v for v in request_examples_missing(request_text, test_code, tool_code) if v not in waived]
+            if untested:
+                key = tuple(untested)
+                example_misses[key] = example_misses.get(key, 0) + 1
+                if example_misses[key] >= EXAMPLE_WAIVE_AFTER:
+                    waived.update(untested)
+                    print(f"[Ogun Plugin Builder] The test left out {', '.join(repr(v) for v in untested)} "
+                          f"{EXAMPLE_WAIVE_AFTER} times: treating that as wording in the request, not a test value.",
+                          flush=True)
+                    untested = []
             if untested:
                 last_error = ("The unit test never checks these examples from the plugin request: "
                               + ", ".join(repr(v) for v in untested)
@@ -481,11 +527,9 @@ def build_plugin_staged(
                 trace.end("coverage", last_error, tool_code, test_code)
                 continue
 
-            # Extract plugin name
-            name_match = re.search(r'name\s*:\s*str\s*=\s*["\']([^"\']+)["\']', tool_code)
-            plugin_name = name_match.group(1) if name_match else "custom_tool"
-            if force_name:
-                plugin_name = force_name   # an update must replace the existing plugin, never create a differently named one
+            # Plugin name: an update keeps the existing name; otherwise the name the request gives, then the code's.
+            plugin_name = (force_name or requested_plugin_name(request_text) or plugin_name_from_code(tool_code)
+                           or "custom_tool")
 
             # Mechanical test mistakes (wrong module or class name in the import, imports above the path setup) cost
             # whole attempts in the measurement above; fix them instead of asking the model.

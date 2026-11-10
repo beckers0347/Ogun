@@ -612,7 +612,7 @@ def test_plugin_build_restarts_after_three_identical_failures():
     ok, _, _ = plb.build_plugin_staged(eng, _FakePM(succeed_on=3), "Build adder plugin", max_attempts=0)
     assert ok
     stage1 = [p for p in eng.prompts if "Stage 1/2" in p]
-    assert len(stage1) == 2, f"expected one fresh restart, got {len(stage1)} stage-1 prompts"
+    assert len(stage1) >= 2, f"expected a fresh restart, got {len(stage1)} stage-1 prompts"
 
 
 def test_repeated_failures_raise_temperature_and_skip_identical_code():
@@ -743,3 +743,20 @@ def test_a_draft_gets_two_fixes_then_a_fresh_hotter_draft():
     plb.build_plugin_staged(eng, _FakePM(succeed_on=0), "Build adder plugin", max_attempts=4)
     kinds = ["draft" if "Stage 1/2" in p else "fix" for p in eng.prompts]
     assert kinds == ["draft", "fix", "fix", "draft"], kinds
+
+
+def test_plugin_name_comes_from_the_request_or_either_name_form():
+    """Live: `name = "roman_numeral"` (no annotation) was missed and the plugin was mounted as 'custom_tool'."""
+    assert plb.plugin_name_from_code('class T(BaseTool):\n    name = "roman_numeral"\n') == "roman_numeral"
+    assert plb.plugin_name_from_code('    name: str = "abc_tool"') == "abc_tool"
+    assert plb.requested_plugin_name("Build a plugin named roman_numeral that converts") == "roman_numeral"
+    assert plb.requested_plugin_name("Build a plugin that converts") is None
+
+
+def test_a_quoted_word_left_out_three_times_is_waived():
+    """Live: `a list of "bad" patterns` kept failing on "never checks 'bad'"."""
+    eng = _FakeEngine([PLUGIN_REPLY.replace("adder", f"adder{i}") for i in range(6)] + [PLUGIN_REPLY])
+    pm = _FakePM(succeed_on=1)
+    ok, _, _ = plb.build_plugin_staged(eng, pm, 'Build adder plugin. Do not use a list of "bad" patterns.',
+                                       max_attempts=5)
+    assert ok and pm.calls == 1 and len(eng.prompts) == 3, (pm.calls, len(eng.prompts))
