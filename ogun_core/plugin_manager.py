@@ -29,6 +29,7 @@ from ogun_core.paths import (
     REGISTRY_PATH,
 )
 from ogun_core.security import PathSecurityGuard
+from ogun_core.kit.build_kit import plugin_shape_problems  # noqa: F401 - shared, re-exported
 
 _PLACEHOLDER_COMMENT_RE = re.compile(
     r"#\s*(?:placeholder\b|todo\b|mock\b|dummy\b|stub\b|to be implemented|replace with actual|in a real implementation)",
@@ -96,6 +97,7 @@ class PluginManager:
         self.default_timeout = default_timeout
 
         self._active_tools: Dict[str, BaseTool] = {}
+        self._tool_files: Dict[str, Path] = {}      # name -> source file (for isolated execution)
         self._lock = threading.RLock()
         self.security_guard = PathSecurityGuard(base_dir=self.base_dir)
 
@@ -333,6 +335,7 @@ class PluginManager:
                 tool_instance.name = name
                 with self._lock:
                     self._active_tools[name] = tool_instance
+                    self._tool_files[name] = tool_path
                 return tool_instance
         except Exception as exc:
             print(f"[WARNING] Failed to load tool from {tool_path}: {exc}", file=sys.stderr)
@@ -370,6 +373,26 @@ class PluginManager:
             return ToolResult.error(f"Plugin '{name}' is not registered or active.")
 
         timeout_sec = timeout or self.default_timeout
+
+        # 1. Arguments must match the plugin's schema before anything runs.
+        from ogun_core.kit.schema_check import validate
+        try:
+            schema = tool.get_parameters_schema()
+        except Exception:  # noqa: BLE001
+            schema = {}
+        problems = validate(kwargs, schema)
+        if problems:
+            return ToolResult.error(error_trace=f"Invalid arguments for '{name}' (nothing was run): "
+                                                + "; ".join(problems))
+
+        # 2. A plugin with a source file runs in its own process: a hang is killed at the timeout, a crash is a
+        #    failed call (in a thread, a timed-out plugin kept running inside Ogun). OGUN_PLUGIN_ISOLATION=0 opts out.
+        source = self._tool_files.get(normalize_plugin_name(name))
+        if source is not None and source.exists() and os.environ.get("OGUN_PLUGIN_ISOLATION", "1") != "0":
+            from ogun_core.kit.plugin_runner import run_isolated
+            res = run_isolated(self.base_dir, source, kwargs, timeout=timeout_sec, extra_paths=[str(OGUN_ROOT)])
+            return ToolResult(status=res.get("status", "error"), output=res.get("output"),
+                              error_trace=res.get("error_trace"))
 
         def _runner() -> ToolResult:
             try:
@@ -412,6 +435,10 @@ class PluginManager:
         valid, err = self.validate_plugin_code(code)
         if not valid:
             return ToolResult.error(f"Plugin AST validation failed: {err}")
+        _missing = plugin_shape_problems(code)
+        if _missing:
+            return ToolResult.error("Plugin AST validation failed: the plugin needs " + "; ".join(_missing)
+                                    + ". Nothing was installed.")
 
         # 2. Check paths against security guard
         tool_file = self.custom_tools_dir / f"{norm_name}.py"
@@ -511,3 +538,5 @@ class PluginManager:
                 self.save_registry(registry)
                 return ToolResult.success(f"Plugin '{norm_name}' disabled.")
         return ToolResult.error(f"Plugin '{norm_name}' not found.")
+
+

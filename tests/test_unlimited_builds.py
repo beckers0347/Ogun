@@ -760,3 +760,31 @@ def test_a_quoted_word_left_out_three_times_is_waived():
     ok, _, _ = plb.build_plugin_staged(eng, pm, 'Build adder plugin. Do not use a list of "bad" patterns.',
                                        max_attempts=5)
     assert ok and pm.calls == 1 and len(eng.prompts) == 3, (pm.calls, len(eng.prompts))
+
+
+
+
+def test_disputed_case_is_checked_on_its_own_and_needs_two_agreeing_answers():
+    """Live: every draft's test expected a BMI of 24.69 to be 'overweight'; the tool ('normal') was right."""
+    err = ("STDERR: FAIL execute({'weight': 80, 'height': 1.8}): expected {'category': 'overweight'}, "
+           "got success {'category': 'normal'} None")
+    case = plb.disputed_case(err)
+    assert case == ("{'weight': 80, 'height': 1.8}", "{'category': 'overweight'}", "success {'category': 'normal'} None")
+    # asked with the options swapped the second time: a consistent verdict is B, then A
+    agree = iter(["24.69 < 25 so normal. ANSWER: B", "ANSWER: A"])
+    note = plb.arbitrate_case(lambda q: next(agree), "bmi with categories", case)
+    assert "TOOL's result" in note and "WRONG" in note
+    split = iter(["ANSWER: B", "ANSWER: B"])            # flips with the option order: not a verdict
+    assert plb.arbitrate_case(lambda q: next(split), "bmi with categories", case) == ""
+    assert plb.disputed_case("Traceback: NameError") is None
+
+
+
+def test_a_case_that_keeps_failing_is_dropped_but_not_a_quoted_one():
+    """Live: every draft's test expected the mistyped 'mmmcmmxcix' to be 3999; the update hit the 15-minute cap."""
+    from ogun_core import plugin_builder as pb
+    test = 'CASES = [\n    ({"value": "mmmcmmxcix", "direction": "to_int"}, 3999),\n    ({"value": "I"}, 1),\n]\n'
+    assert "mmmcmmxcix" not in pb.drop_case_line(test, "{'value': 'mmmcmmxcix', 'direction': 'to_int'}")
+    assert pb.drop_case_line(test, "{'value': 'zzz'}") == test
+    assert pb.case_quoted_in_request("{'value': 'VX'}", "invalid numerals like 'VX' must fail")
+    assert not pb.case_quoted_in_request("{'value': 'mmmcmmxcix'}", "accept lowercase too")

@@ -93,9 +93,23 @@ def get_vram_profile():
     return _ACTIVE["profile"]
 
 
+def _kit_pinned(key):
+    """The shared, pinned load option (ogun_core.kit.gpu_lease) or None when pinning is off (KIT_GPU_LOCK=0)."""
+    try:
+        from ogun_core.kit.gpu_lease import pinned
+        return pinned(key)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def get_num_gpu():
-    """The ACTIVE num_gpu (None = do not send the option). Read at CALL TIME: never copy this into a module constant."""
-    return _ACTIVE["num_gpu"]
+    """The ACTIVE num_gpu (None = do not send the option). Read at CALL TIME: never copy this into a module constant.
+
+    While the shared GPU lock is on (default) every local app sends the same layer count, so Ollama never reloads the
+    model when requests alternate between apps (live: 47 vs 48 layers forced reloads).
+    """
+    p = _kit_pinned("num_gpu")
+    return p if p is not None else _ACTIVE["num_gpu"]
 
 
 def set_vram_profile(name):
@@ -110,12 +124,14 @@ def set_vram_profile(name):
 
 def get_num_ctx():
     """Context window in tokens: the auto-tuned value once a hardware profile is applied, else NUM_CTX. Read at CALL TIME."""
-    return _ACTIVE["num_ctx"] or NUM_CTX
+    p = _kit_pinned("num_ctx")
+    return p if p is not None else (_ACTIVE["num_ctx"] or NUM_CTX)
 
 
 def get_num_thread():
     """CPU threads for inference (None = let Ollama decide). Read at CALL TIME."""
-    return _ACTIVE["num_thread"]
+    p = _kit_pinned("num_thread")
+    return p if p is not None else _ACTIVE["num_thread"]
 
 
 def get_hardware_profile():
@@ -173,6 +189,9 @@ def get_keep_alive() -> str:
 
 def get_num_batch() -> int | None:
     """Return tuned prompt evaluation batch size for CPU/hybrid profiles (128 fits L2/L3 cache better than 512)."""
+    p = _kit_pinned("num_batch")
+    if p is not None:
+        return p
     hw = get_hardware_profile() if _ACTIVE.get("profile") == "AUTO" else None
     if isinstance(hw, dict) and hw.get("mode") in ("cpu", "hybrid"):
         return int(hw.get("num_batch") or 128)

@@ -8,11 +8,33 @@ from __future__ import annotations
 
 import ast
 import re
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from ogun_core.engine import CoreEngine
 from ogun_core.plugin_manager import PluginManager
 from ogun_core.quality import check_requirements_coverage, fit_feedback, research_build_failure
+from ogun_core.kit.build_kit import (  # noqa: F401 - shared helpers, re-exported
+    BASE_TEMPERATURE,
+    MAX_FIXES_PER_DRAFT,
+    EXAMPLE_WAIVE_AFTER,
+    FRESH_DRAFT_TEMPERATURE,
+    FIX_TEMPERATURE,
+    _BOOT,
+    _tool_class,
+    normalize_plugin_test,
+    _FAIL_LINE_RE,
+    disputed_case,
+    DROP_DISPUTED_AFTER,
+    case_quoted_in_request,
+    drop_case_line,
+    arbitrate_case,
+    same_failure_streak,
+    retry_temperature,
+    is_tool_block,
+    TEST_SUSPECT_NOTE,
+    STUCK_NOTE,
+    tool_code_error_context,
+)
 
 
 def parse_code_blocks(text: str) -> List[str]:
@@ -53,16 +75,6 @@ def _research_plugin_failure(engine: CoreEngine, request_text: str, last_error: 
 # attempts that all failed the same way; 3 is enough to tell the code is stuck.
 RESTART_AFTER_SAME_FAILURES = 3
 STAGE_MAX_TOKENS = 3072
-BASE_TEMPERATURE = 0.2
-# Measured 2026-11-09 on the Roman-numeral request (27 sampled fix replies, 25 sampled first drafts): fixes of a draft
-# whose logic is wrong almost never pass (0/27), while fresh drafts pass about one time in five. So a draft gets at most
-# MAX_FIXES_PER_DRAFT fixes, then a fresh draft is written at a higher temperature so it differs from the last one.
-MAX_FIXES_PER_DRAFT = 2
-# Quoted words the model leaves out of its test this many times are taken as wording, not test values. Live
-# 2026-11-10: a request saying `a list of "bad" patterns` failed 29 attempts in a row on "never checks 'bad'".
-EXAMPLE_WAIVE_AFTER = 3
-FRESH_DRAFT_TEMPERATURE = 0.7
-FIX_TEMPERATURE = 0.3
 
 # Short build prompt (the long PLUGIN_BUILDER_PROMPT with its template made replies ~35% longer with no better pass rate
 # in the same measurement). Every step's prompt starts with it.
@@ -82,10 +94,16 @@ TEST (saved as plugins/tests/test_<name>.py, run as a script, no pytest)
 
 - Use this loop (fill in the cases; "error" marks a case that must fail):
   ```
+  def same(a, b):        # numbers within rounding error count as equal (-459.67 vs -459.66999999999996)
+      if isinstance(a, dict) and isinstance(b, dict):
+          return a.keys() == b.keys() and all(same(a[k], b[k]) for k in a)
+      if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool):
+          return abs(a - b) <= 1e-6 * max(1.0, abs(b))
+      return a == b
   CASES = [({"param": "valid input"}, <expected output>), ({"param": "bad input"}, "error")]
   for kwargs, expected in CASES:
       res = tool.execute(**kwargs)
-      ok = res.status == "error" if expected == "error" else (res.status == "success" and res.output == expected)
+      ok = res.status == "error" if expected == "error" else (res.status == "success" and same(res.output, expected))
       if not ok:
           print(f"FAIL execute({kwargs}): expected {expected!r}, got {res.status} {res.output!r} {res.error_trace!r}",
                 file=sys.stderr)
@@ -93,70 +111,8 @@ TEST (saved as plugins/tests/test_<name>.py, run as a script, no pytest)
   print("PASS")
   ```
   `<expected output>` must be exactly what the tool returns as `output` (if it returns {"result": x}, expect {"result": x}).
+  Write expected numbers as Python expressions from the inputs (e.g. {"bmi": 90 / 1.75 ** 2}), never as a number you worked out yourself: hand-worked numbers were wrong in live builds (a BMI of 28.57 for 90 kg, 1.75 m).
 """
-
-
-_BOOT = ("import sys as _plugin_test_sys\nfrom pathlib import Path as _PluginTestPath\n"
-         "_plugin_test_sys.path.insert(0, str(_PluginTestPath(__file__).resolve().parents[2]))\n")
-
-
-def _tool_class(tool_code: str):
-    try:
-        tree = ast.parse(tool_code)
-    except SyntaxError:
-        m = re.search(r"^class\s+(\w+)\s*\([^)]*BaseTool", tool_code or "", re.M)
-        return m.group(1) if m else None, set()
-    names = {n.name for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
-    names |= {t.id for n in tree.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
-    for n in tree.body:
-        if isinstance(n, ast.ClassDef) and any("BaseTool" in ast.unparse(b) for b in n.bases):
-            return n.name, names
-    return None, names
-
-
-def normalize_plugin_test(test_code: str, tool_code: str, module_name: str) -> str:
-    if not test_code or not module_name:
-        return test_code
-    cls, defined = _tool_class(tool_code)
-
-    def fix_from(m):
-        names = m.group(2)
-        if cls:
-            parts = [p.strip() for p in names.split(",")]
-            fixed = []
-            for p in parts:
-                base, _, alias = p.partition(" as ")
-                base = base.strip()
-                if base and base not in defined and base[:1].isupper():
-                    alias = alias.strip() or base      # keep the name the test uses
-                    p = f"{cls} as {alias}" if alias != cls else cls
-                fixed.append(p)
-            names = ", ".join(fixed)
-        return f"from plugins.custom_tools.{module_name} import {names}"
-
-    # Live: `from plugins.tools.roman_numeral import ...` failed 13 attempts in a row. Any plugins.* / custom_tools.*
-    # path, or the bare module name, means the tool module.
-    out = re.sub(r"from\s+(plugins(?:\.\w+)*|custom_tools(?:\.\w+)*|" + re.escape(module_name)
-                 + r")\s+import\s+([^\n(]+)", fix_from, test_code)
-    out = re.sub(r"import\s+plugins\.custom_tools\.(\w+)", f"import plugins.custom_tools.{module_name}", out)
-    out = re.sub(r"plugins\.custom_tools\.(?!" + re.escape(module_name) + r"\b)(\w+)\.(\w+)",
-                 lambda m: f"plugins.custom_tools.{module_name}.{m.group(2)}", out)
-    if "_plugin_test_sys" not in out:
-        lines = out.splitlines(keepends=True)
-        at = 0
-        # keep a module docstring and `from __future__` imports first
-        try:
-            tree = ast.parse(out)
-            for n in tree.body:
-                if (isinstance(n, ast.Expr) and isinstance(getattr(n, "value", None), ast.Constant)
-                        and isinstance(n.value.value, str)) or (isinstance(n, ast.ImportFrom) and n.module == "__future__"):
-                    at = n.end_lineno
-                else:
-                    break
-        except SyntaxError:
-            pass
-        out = "".join(lines[:at]) + _BOOT + "".join(lines[at:])
-    return out
 
 
 def plugin_name_from_code(code: str) -> Optional[str]:
@@ -172,7 +128,8 @@ def requested_plugin_name(request_text: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def generate(engine: Any, prompt: str, temperature: float = BASE_TEMPERATURE) -> str:
+def generate(engine: Any, prompt: str, temperature: float = BASE_TEMPERATURE, fmt: Optional[Any] = None,
+             num_predict: Optional[int] = None) -> str:
     """One fresh model call: the prompt alone, no chat history, no tool schemas.
 
     Live 2026-11-09: every build step went through run_turn (system prompt, every tool schema, the honesty check and
@@ -182,73 +139,16 @@ def generate(engine: Any, prompt: str, temperature: float = BASE_TEMPERATURE) ->
     client = getattr(engine, "client", None)
     if isinstance(engine, CoreEngine) and client is not None and hasattr(client, "chat"):
         msgs = [{"role": "user", "content": prompt}]
+        from ogun_core.kit.sampling import top_p_for
+        opts = {"num_predict": num_predict or STAGE_MAX_TOKENS, "temperature": temperature,
+                "top_p": top_p_for(temperature)}
         try:
-            r = client.chat(msgs, tools=None, options={"num_predict": STAGE_MAX_TOKENS, "temperature": temperature})
+            r = (client.chat(msgs, tools=None, options=opts, format=fmt) if fmt is not None
+                 else client.chat(msgs, tools=None, options=opts))
         except TypeError:
             r = client.chat(msgs, tools=None)
         return (r or {}).get("content", "") or ""
     return engine.run_turn(prompt)
-
-
-def same_failure_streak(errors: List[str]) -> int:
-    """How many of the latest failures in a row are the same failure (0 when there is none)."""
-    n = 0
-    for e in reversed(errors):
-        if e != errors[-1]:
-            break
-        n += 1
-    return n
-
-
-def retry_temperature(streak: int) -> float:
-    """Low temperature first; each repeat of the same failure samples more widely so the next fix differs."""
-    return FIX_TEMPERATURE if streak <= 1 else min(FIX_TEMPERATURE + 0.25 * (streak - 1), 0.9)
-
-
-def is_tool_block(code: str) -> bool:
-    """A fix reply with one block: is it the tool (defines the BaseTool class) or the test?"""
-    return bool(re.search(r"^\s*class\s+\w+\s*\([^)]*BaseTool", code or "", re.M))
-
-
-STUCK_NOTE = ("The previous fix produced this SAME failure again, so the current approach to this case does not work. "
-              "Do not patch it: rewrite the logic that decides this case with a different method.")
-
-
-def tool_code_error_context(tool_code: str, error: str) -> str:
-    """The tool-code lines a syntax error or traceback points at (>> marks the line).
-
-    Live: "SyntaxError at line 17: invalid syntax" came back four attempts running; the fix prompt showed the test's
-    lines but never line 17 of the tool, so the model could not see what to fix.
-    """
-    if not tool_code or not error:
-        return ""
-    lines = tool_code.splitlines()
-    spots: List[int] = []
-    if "test_" not in error.split("SyntaxError at line")[0][-200:]:
-        spots += [int(n) - 1 for n in re.findall(r"SyntaxError at line (\d+)", error)]
-    spots += [int(n) - 1 for n in re.findall(r'File "[^"]*custom_tools[^"]*\.py", line (\d+)', error)]
-    # A NameError the tool caught itself has no line number ("Execution failed: name 'x' is not defined"). Live: four
-    # attempts in a row could not find it; show where the name is used.
-    undefined = re.findall(r"name '([A-Za-z_]\w*)' is not defined", error)
-    for nm in undefined[:1]:
-        spots += [i for i, ln in enumerate(lines) if re.search(rf"\b{re.escape(nm)}\b", ln)][:3]
-    marked = sorted({i for i in spots if 0 <= i < len(lines)})[:3]
-    windows: List[List[int]] = []          # overlapping windows merge into one listing with several >> marks
-    for i in marked:
-        lo, hi = max(0, i - 4), min(len(lines), i + 3)
-        if windows and lo <= windows[-1][1]:
-            windows[-1][1] = max(windows[-1][1], hi)
-        else:
-            windows.append([lo, hi])
-    blocks = ["\n".join(f"{n + 1:4d}{'>>' if n in marked else '  '} {lines[n]}" for n in range(lo, hi))
-              for lo, hi in windows]
-    if not blocks:
-        return ""
-    head = "THE FAILING LINE IN THE TOOL CODE (>> marks it):\n"
-    if undefined:
-        head = (f"`{undefined[0]}` is used where it is not defined (a name defined inside one function or method is "
-                f"not visible in another). Where `{undefined[0]}` appears in the tool code (>> marks it):\n")
-    return head + "\n...\n".join(blocks)
 
 
 def failing_check_context(test_code: str, error: str, max_spots: int = 3) -> str:
@@ -330,7 +230,18 @@ def _note_failure(errors_seen: List[str], attempt: int, of_total: str, error: st
     print(f"[Ogun Plugin Builder] Attempt {attempt}{of_total} failed: {first[:300]}", flush=True)
 
 
-def build_plugin_staged(
+def build_plugin_staged(*args: Any, **kwargs: Any) -> Tuple[bool, str, Optional[str]]:
+    """Build or update a plugin while holding the shared model lease (see _build_plugin_staged for the loop)."""
+    from ogun_core.kit.gpu_lease import acquire
+    lease = acquire("ogun", "plugin build")
+    try:
+        return _build_plugin_staged(*args, **kwargs)
+    finally:
+        if lease:
+            lease.release()
+
+
+def _build_plugin_staged(
     engine: CoreEngine,
     plugin_manager: PluginManager,
     request_text: str,
@@ -357,6 +268,10 @@ def build_plugin_staged(
     last_submitted: List[Tuple[str, str]] = []   # the last run's code, as written and as normalized
     skipped_same = False
     fixes_on_draft = 0
+    suspect_test = False
+    arbitrated: dict = {}
+    case_fails: dict = {}
+    dropped_cases: List[str] = []
     waived: set = set()
     example_misses: dict = {}
     trace = _Trace()
@@ -395,8 +310,21 @@ def build_plugin_staged(
             streak = same_failure_streak(errors_seen) if have_stage1 else 0
             temperature = (retry_temperature(streak) if have_stage1
                            else (FRESH_DRAFT_TEMPERATURE if restarted else BASE_TEMPERATURE))
+            dropped_now = False
+            case = disputed_case(last_error) if (have_stage1 and test_code) else None
+            if (case and case_fails.get(case, 0) >= DROP_DISPUTED_AFTER
+                    and not case_quoted_in_request(case[0], request_text)):
+                slimmer = drop_case_line(test_code, case[0])
+                if slimmer != test_code:
+                    test_code, dropped_now = slimmer, True
+                    dropped_cases.append(case[0])
+                    print(f"[Ogun Plugin Builder] The test case execute({case[0][:80]}) failed "
+                          f"{case_fails[case]} test runs: dropping that one case "
+                          "and testing again.", flush=True)
             try:
-                if not have_stage1:
+                if dropped_now:
+                    pass
+                elif not have_stage1:
                     fixes_on_draft = 0
                     # Stage 1: the tool and its test in one reply.
                     stage1_prompt = (
@@ -443,6 +371,16 @@ def build_plugin_staged(
                     code_where = tool_code_error_context(tool_code, last_error)
                     if code_where:
                         where = (where + "\n" if where else "") + code_where
+                    case = disputed_case(last_error) if (streak >= 2 or suspect_test) else None
+                    if case and case not in arbitrated:
+                        print(f"[Ogun Plugin Builder] Checking the disputed case execute({case[0][:80]}) on its own...",
+                              flush=True)
+                        arbitrated[case] = arbitrate_case(
+                            lambda q, schema=None: generate(engine, q, 0.0, fmt=schema, num_predict=600),
+                            request_text, case)
+                        if arbitrated[case]:
+                            fixes_on_draft = min(fixes_on_draft, MAX_FIXES_PER_DRAFT - 1)   # let this fix use it
+                    verdict = arbitrated.get(case, "") if case else ""
                     correction_prompt = (
                         f"{STAGED_PROMPT}\n"
                         f"Attempt {attempt}{of_total} - this plugin FAILED verification.\n"
@@ -451,7 +389,8 @@ def build_plugin_staged(
                         f"=== CURRENT TEST CODE ===\n```python\n{test_code}\n```\n"
                         f"=== FAILURE ===\n{fit_feedback(last_error, 2500)}\n"
                         + (f"{where}\n" if where else "")
-                        + (f"{STUCK_NOTE}\n" if streak >= 2 else "")
+                        + (f"{verdict}\n" if verdict else (f"{TEST_SUSPECT_NOTE}\n" if suspect_test
+                                                            else (f"{STUCK_NOTE}\n" if streak >= 2 else "")))
                         + (f"{fit_feedback(research_notes, 1500)}\n" if research_notes else "")
                         + "=== HOW TO FIX ===\n"
                         "Find the failing check above and the input it uses. If that check matches the plugin "
@@ -492,7 +431,11 @@ def build_plugin_staged(
             # Only once in a row, so a model that keeps repeating itself still gets its code run (and a fake can't loop).
             if (tool_code, test_code) in last_submitted and not skipped_same:
                 skipped_same = True
-                fixes_on_draft = MAX_FIXES_PER_DRAFT   # the fixes have run dry: the next attempt is a fresh draft
+                if suspect_test:                       # already asked to check the test: write a fresh draft
+                    fixes_on_draft = MAX_FIXES_PER_DRAFT
+                else:                                  # one more fix, told that the test is the likely culprit
+                    suspect_test = True
+                    fixes_on_draft = min(fixes_on_draft, MAX_FIXES_PER_DRAFT - 1)
                 errors_seen.append(last_error)
                 print(f"[Ogun Plugin Builder] Attempt {attempt}{of_total} returned the same code again; "
                       "retrying with more variation.", flush=True)
@@ -533,6 +476,8 @@ def build_plugin_staged(
 
             # Mechanical test mistakes (wrong module or class name in the import, imports above the path setup) cost
             # whole attempts in the measurement above; fix them instead of asking the model.
+            if last_submitted and test_code != last_submitted[0][1]:
+                suspect_test = False             # the test was changed: judge it afresh
             written = (tool_code, test_code)
             test_code = normalize_plugin_test(test_code, tool_code, plugin_name)
 
@@ -542,12 +487,17 @@ def build_plugin_staged(
             trace.mark("install_and_test")
             if res.status == "success":
                 trace.end("pass", "", tool_code, test_code)
+                note = (" Dropped test case(s) the model kept disputing: "
+                        + "; ".join(f"execute({c[:80]})" for c in dropped_cases) + ".") if dropped_cases else ""
                 return (
                     True,
-                    f"[PASS] Plugin '{plugin_name}' successfully built, tested, and mounted on attempt {attempt}.",
+                    f"[PASS] Plugin '{plugin_name}' successfully built, tested, and mounted on attempt {attempt}.{note}",
                     plugin_name,
                 )
             last_error = res.error_trace or "Subprocess unit test execution failed."
+            _failed_case = disputed_case(last_error)
+            if _failed_case:
+                case_fails[_failed_case] = case_fails.get(_failed_case, 0) + 1
             _note_failure(errors_seen, attempt, of_total, last_error)
             trace.end("test_failed", last_error, tool_code, test_code)
     except KeyboardInterrupt:

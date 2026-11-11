@@ -159,6 +159,8 @@ BUILTIN_TOOL_SCHEMAS = [
 class OllamaClient:
     """Client for Ollama API with fallback to standard library urllib."""
 
+    supports_structured = True     # chat(format=<JSON schema>) constrains decoding to that schema
+
     def __init__(
         self,
         host: str = OLLAMA_HOST,
@@ -216,8 +218,12 @@ class OllamaClient:
         options: Optional[Dict[str, Any]] = None,
         stream: bool = False,
         on_token: Optional[Callable[[str], None]] = None,
+        format: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Send chat request to Ollama using live adaptive timeout and optional token streaming."""
+        """Send chat request to Ollama using live adaptive timeout and optional token streaming.
+
+        `format`: a JSON schema (or "json"); Ollama compiles it into a decoding grammar, so the reply is JSON that
+        matches it."""
         overrides = options or {}
         options = llm_options(**overrides)
         eff_timeout = self.get_effective_timeout()
@@ -237,6 +243,8 @@ class OllamaClient:
             }
             if tools:
                 kwargs["tools"] = tools
+            if format is not None:
+                kwargs["format"] = format
             if use_stream:
                 kwargs["stream"] = True
                 stream_resp = client.chat(**kwargs)
@@ -281,6 +289,8 @@ class OllamaClient:
         }
         if tools:
             payload["tools"] = tools
+        if format is not None:
+            payload["format"] = format
 
         data_bytes = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -304,34 +314,38 @@ class OllamaClient:
 
 
 class ContextManager:
-    """Manages conversational history within context token boundaries."""
+    """Keeps the session history (between turns) within the context window, counted with the model's own tokenizer.
 
-    def __init__(self, max_tokens: Optional[int] = None, budget_ratio: float = 0.85) -> None:
+    Inside a turn the ContextLedger (ogun_core/kit/context_ledger.py) builds each request; this only trims the
+    stored conversation. The system prompt and the latest user request are pinned: they are never dropped.
+    """
+
+    def __init__(self, max_tokens: Optional[int] = None, budget_ratio: float = 0.85, model: Optional[str] = None) -> None:
         if max_tokens is None:
-            max_tokens = get_num_ctx()      # live: follows the auto-tuned context window
+            max_tokens = get_num_ctx()      # live: follows the context window
         self.max_tokens = int(max_tokens * budget_ratio)
+        from ogun_core.kit.tokenizer import get_tokenizer
+        self.tokenizer = get_tokenizer(model or MODEL_NAME)
 
     def estimate_tokens(self, messages: List[Dict[str, Any]]) -> int:
-        total_chars = 0
-        for m in messages:
-            content = m.get("content") or ""
-            total_chars += len(content)
-            for tc in m.get("tool_calls", []):
-                total_chars += len(json.dumps(tc))
-        return total_chars // 4
+        """Exact token count of the messages as the chat template frames them (estimate only without the model file)."""
+        return self.tokenizer.count_messages(messages)
 
     def prune_history(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Keep system message and drop oldest non-system turns if over budget."""
+        """Drop the oldest turns while over budget; the system prompt and the latest user request always stay."""
         if not messages:
             return messages
-
         system_msg = messages[0] if messages[0].get("role") == "system" else None
         turns = messages[1:] if system_msg else messages[:]
-
-        while turns and self.estimate_tokens(([system_msg] if system_msg else []) + turns) > self.max_tokens:
-            turns.pop(0)
-
-        return ([system_msg] if system_msg else []) + turns
+        last_user = max((i for i, m in enumerate(turns) if m.get("role") == "user"), default=None)
+        pinned = turns[last_user] if last_user is not None else None
+        head = ([system_msg] if system_msg else [])
+        while turns and self.estimate_tokens(head + turns) > self.max_tokens:
+            idx = next((i for i, m in enumerate(turns) if m is not pinned), None)
+            if idx is None:
+                break
+            turns.pop(idx)
+        return head + turns
 
 
 class CoreEngine:
@@ -359,6 +373,98 @@ class CoreEngine:
             "error": "",
         }
 
+    def _chat(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None,
+              options: Optional[Dict[str, Any]] = None, fmt: Optional[Any] = None) -> Dict[str, Any]:
+        """client.chat with sampling options and an optional JSON-schema format; simple test clients take neither."""
+        try:
+            if fmt is not None:
+                return self.client.chat(messages, tools=tools, options=options, format=fmt)
+            return self.client.chat(messages, tools=tools, options=options)
+        except TypeError:
+            return self.client.chat(messages, tools=tools)
+
+    retry_backoff: Tuple[float, ...] = (5.0, 20.0)   # seconds before the 2nd and 3rd try of a failed model call
+
+    def _chat_retry(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None,
+                    options: Optional[Dict[str, Any]] = None, fmt: Optional[Any] = None) -> Dict[str, Any]:
+        """_chat with automatic retries of transient failures (timeout, connection), each with a smaller reply budget.
+
+        Before: one timeout ended the turn with "say 'continue' to resume". Only when every try fails does the error
+        reach the turn (and the run journal keeps what was done, so 'continue' resumes from there).
+        """
+        import time as _time
+        opts = dict(options or {})
+        last_exc: Optional[BaseException] = None
+        for attempt in range(len(self.retry_backoff) + 1):
+            try:
+                return self._chat(messages, tools=tools, options=opts or None, fmt=fmt)
+            except (TimeoutError, ConnectionError, urllib.error.URLError) as exc:
+                last_exc = exc
+                if attempt >= len(self.retry_backoff):
+                    break
+                print(f"[Ogun] Model call failed ({type(exc).__name__}); retrying in {self.retry_backoff[attempt]:g}s "
+                      "with a shorter reply budget.", flush=True)
+                _time.sleep(self.retry_backoff[attempt])
+                opts["num_predict"] = max(256, int(int(opts.get("num_predict") or llm_options().get("num_predict")
+                                                       or NUM_PREDICT) * 0.6))
+        assert last_exc is not None
+        raise last_exc
+
+    def _resolve_read_paths(self, name: str, args: Any) -> Any:
+        """read_file / run_python_test / check_syntax: a relative path that does not exist under the project root is
+        tried under workspace/ (live: 'greet/test_greet.py' for workspace/greet/test_greet.py failed ~20 times)."""
+        key = {"read_file": "filepath", "run_python_test": "test_path", "check_syntax": "path_or_code"}.get(name)
+        if not key or not isinstance(args, dict) or not isinstance(args.get(key), str):
+            return args
+        raw = args[key].strip().strip('"').strip("'")
+        if not raw or "\n" in raw or Path(raw).is_absolute() or (self.base_dir / raw).exists():
+            return args
+        alt = self.base_dir / "workspace" / raw
+        return {**args, key: str(Path("workspace") / raw)} if alt.exists() else args
+
+    def _tool_schema(self, name: str) -> Optional[Dict[str, Any]]:
+        for s in BUILTIN_TOOL_SCHEMAS:
+            if s["function"]["name"] == name:
+                return s["function"].get("parameters") or {}
+        return None
+
+    def _structured_tool_call(self, messages: List[Dict[str, Any]], content: str,
+                              registered_names: Set[str]) -> List[Dict[str, Any]]:
+        """The model wrote a tool call as text: ask for it again as JSON constrained to a call schema.
+
+        Lenient text parsing (fenced JSON, literal_eval, {"input": raw} wrappers) is no longer used to extract calls
+        from a client that supports structured output; it only detects that a call was attempted.
+        """
+        from ogun_core.kit.sampling import profile
+        from ogun_core.kit.schema_check import validate
+        from ogun_core.kit.structured import parse_json
+        schema = {"type": "object",
+                  "properties": {"tool": {"type": "string", "enum": sorted(registered_names)},
+                                 "arguments": {"type": "object"}},
+                  "required": ["tool", "arguments"]}
+        ask = messages + [{"role": "assistant", "content": content},
+                          {"role": "user", "content": "Your last reply wrote a tool call as text. Re-emit exactly that "
+                                                      'call as JSON: {"tool": <tool name>, "arguments": {...}}.'}]
+        for _ in range(2):
+            reply = self._chat(ask, tools=None, options=profile("code"), fmt=schema)
+            data = parse_json(reply.get("content", ""))
+            problems = ["not valid JSON"] if data is None else validate(data, schema)
+            if not problems:
+                return [{"name": data["tool"], "arguments": data["arguments"]}]
+            ask = ask + [{"role": "user", "content": "Rejected: " + "; ".join(problems) + ". Reply with valid JSON."}]
+        return []
+
+    def _new_ledger(self, tool_schemas: List[Dict[str, Any]]) -> Any:
+        """A context ledger for one turn: exact token budget = window - reply room - tool schemas - margin."""
+        from ogun_core.kit.context_ledger import ContextLedger
+        from ogun_core.kit.tokenizer import get_tokenizer
+        tok = get_tokenizer(getattr(self.client, "model", None) or MODEL_NAME)
+        reply_room = int(llm_options().get("num_predict") or NUM_PREDICT)
+        schema_tokens = tok.count(json.dumps(tool_schemas)) if tool_schemas else 0
+        budget = max(1024, get_num_ctx() - reply_room - schema_tokens - 256)
+        return ContextLedger(tok.count_messages, budget, count_text=tok.count, tool_output_cap=1200,
+                             keep_recent_results=2, spill_dir=self.base_dir / "workspace" / ".tool_outputs")
+
     def _get_active_tool_schemas(self) -> List[Dict[str, Any]]:
         schemas = list(BUILTIN_TOOL_SCHEMAS)
         if self.plugin_manager:
@@ -377,7 +483,20 @@ class CoreEngine:
         args: Dict[str, Any],
         turn_events: Optional[TurnEvents] = None,
     ) -> str:
-        """Dispatch a tool call to built-in code tools or dynamic plugins."""
+        """Dispatch a tool call to built-in code tools or dynamic plugins.
+
+        Arguments are checked against the tool's schema first; a bad call is answered with the exact problems and the
+        schema, and nothing runs (plugins are checked the same way inside PluginManager.execute_plugin).
+        """
+        schema = self._tool_schema(name)
+        if schema is not None:
+            from ogun_core.kit.schema_check import validate
+            problems = validate(args if isinstance(args, dict) else {"_": args},
+                                {**schema, "additionalProperties": False})
+            if problems:
+                return json.dumps({"error": "invalid_arguments", "tool": name, "problems": problems,
+                                   "expected_schema": schema, "note": "Nothing was run. Fix the arguments and call again."})
+        args = self._resolve_read_paths(name, args)
         try:
             if name == "read_file":
                 return read_file(
@@ -467,6 +586,16 @@ class CoreEngine:
             return f"Error executing tool '{name}': {exc}"
 
     def run_turn(self, user_text: str, max_rounds: int = 10) -> str:
+        """Run one turn while holding the shared model lease (another app must not unload the model mid-turn)."""
+        from ogun_core.kit.gpu_lease import acquire
+        lease = acquire("ogun", "turn", getattr(getattr(self, "client", None), "model", "") or "")
+        try:
+            return self._run_turn(user_text, max_rounds=max_rounds)
+        finally:
+            if lease:
+                lease.release()
+
+    def _run_turn(self, user_text: str, max_rounds: int = 10) -> str:
         """Run an agentic conversational turn with tool execution loop and honesty verification."""
         turn_events = TurnEvents()
 
@@ -488,8 +617,24 @@ class CoreEngine:
         # A request to CHANGE an existing workspace tool or plugin updates it instead of starting something new.
         from ogun_core.standalone_builder import detect_change_target
         # (No routing while a plugin build is running: its own prompts mention the plugin and must reach the model.)
-        _target = None if (clean_user in continuation_words or getattr(self, "_plugin_build_active", False)) \
-            else detect_change_target(effective_user_text)
+        _routing_on = not (clean_user in continuation_words or getattr(self, "_plugin_build_active", False))
+        _target = detect_change_target(effective_user_text) if _routing_on else None
+        # Loosely worded plugin requests ("make a temperature converter plugin", "can the temperature plugin do kelvin
+        # as well") go to the staged plugin builder too; see ogun_core/plugin_intent.py for the live failures.
+        _new_plugin = False
+        if _routing_on and _target is None:
+            from ogun_core.paths import CUSTOM_TOOLS_DIR as _CT_DIR
+            from ogun_core.plugin_intent import resolve_plugin_request
+            _intent = resolve_plugin_request(effective_user_text, _CT_DIR)
+            if _intent and _intent[0] == "update":
+                _target = ("plugin", _intent[1])
+            elif _intent and _intent[0] == "build":
+                _new_plugin = True
+        if _target and _target[0] == "workspace_tool" and not _is_cli_project(self.base_dir, _target[1]):
+            # Live 2026-11-10: "fix add() in workspace/calc/calc.py so test_calc.py passes" went to the CLI updater,
+            # whose command-line smoke tests can never pass for a plain module (21+ attempts, 15-minute cap). A
+            # project that is not a command-line program is changed by the general loop and its verification gate.
+            _target = None
         if _target and _target[0] == "workspace_tool":
             from ogun_core.standalone_builder import update_standalone_project
             try:
@@ -546,6 +691,24 @@ class CoreEngine:
             self.messages.append({"role": "user", "content": user_text})
             self.messages.append({"role": "assistant", "content": final_msg})
             return final_msg
+        if _new_plugin:
+            from ogun_core.plugin_builder import build_plugin_staged
+            self._plugin_build_active = True
+            saved_messages = list(self.messages)
+            try:
+                from ogun_core.config import BUILD_MAX_ATTEMPTS
+                ok, final_msg, _ = build_plugin_staged(self, self.plugin_manager, effective_user_text,
+                                                       max_attempts=BUILD_MAX_ATTEMPTS)
+            except TimeoutError:
+                ok, final_msg = False, "Model request timed out while building the plugin; nothing was added."
+            finally:
+                self._plugin_build_active = False
+                self.messages = saved_messages
+            self.last_turn_status = {"status": "success" if ok else "failed", "task": user_text,
+                                     "error": "" if ok else final_msg[:300]}
+            self.messages.append({"role": "user", "content": user_text})
+            self.messages.append({"role": "assistant", "content": final_msg})
+            return final_msg
 
         # Check if standalone CLI project request
         from ogun_core.quality import classify_project_request
@@ -587,9 +750,56 @@ class CoreEngine:
         tool_schemas = self._get_active_tool_schemas()
         registered_names = self._get_registered_tool_names()
 
-        for round_idx in range(max_rounds):
+        # Each request is built by the context ledger: system prompt and this task are pinned, earlier turns and
+        # older tool output are compacted first, and every tool call stays paired with its result.
+        ledger = self._new_ledger(tool_schemas)
+        ledger.set_system(self.messages[0]["content"] if self.messages and self.messages[0].get("role") == "system"
+                          else SYSTEM_PROMPT)
+        ledger.add_history(self.messages[1:-1])
+        ledger.set_task(effective_user_text)
+        ledger.compact()
+        self.last_ledger = ledger
+
+        # PLAN -> EXECUTE -> VERIFY (ogun_core/turn_controller.py) for clients with structured output. The run journal
+        # records the plan, every tool step and every verdict, so 'continue' after a failure resumes from it.
+        from ogun_core.kit.context_ledger import receipt_for
+        from ogun_core.kit.run_journal import RunJournal
+        from ogun_core import turn_controller as tc_ctl
+        structured = bool(getattr(self.client, "supports_structured", False))
+        task_key = self.last_turn_status.get("task", user_text) if clean_user in continuation_words else user_text
+        journal_dir = self.base_dir / "workspace" / ".journal"
+        journal = None
+        plan = None
+        if structured:
+            previous = RunJournal.latest(journal_dir, task_key) if clean_user in continuation_words else None
+            if previous is not None and previous.state().get("plan"):
+                journal, plan = previous, previous.state()["plan"]
+                for line in previous.state()["receipts"][-12:]:
+                    ledger.note(line)
+                ledger.note("Resumed after an interruption: the steps above were already done.")
+                journal.log("resume")
+            else:
+                journal = RunJournal.start(journal_dir, task_key)
+                plan = tc_ctl.make_plan(self, effective_user_text, sorted(registered_names))
+                if plan:
+                    journal.log("plan", plan=plan)
+            if plan:
+                ledger.set_plan(tc_ctl.format_plan(plan))
+                ledger.compact()
+        self.last_plan = plan
+        verify_cycles = 0
+        round_budget = tc_ctl.PLAN_ROUND_BUDGET if plan else max_rounds
+        call_state: Dict[str, Tuple[int, int, int]] = {}    # call -> (result hash, identical repeats, files written)
+
+        def _run_test(path: str) -> str:
+            out = run_python_test(test_path=path, base_dir=self.base_dir)
+            turn_events.add_test_execution(test_path=path, passed=str(out).startswith("TEST PASS"), output=str(out))
+            return out
+
+        for round_idx in range(round_budget):
             try:
-                response = self.client.chat(self.messages, tools=tool_schemas)
+                from ogun_core.kit.sampling import profile as _sampling
+                response = self._chat_retry(ledger.messages(), tools=tool_schemas, options=_sampling("code"))
             except TimeoutError:
                 eff_timeout = (
                     getattr(self.client, "get_effective_timeout", lambda: 300.0)()
@@ -597,9 +807,11 @@ class CoreEngine:
                     else getattr(self.client, "timeout", 300.0)
                 )
                 err_msg = (
-                    f"Model request timed out after {eff_timeout:.0f} seconds. Ollama may be loading weights or overloaded. "
-                    "Your progress has been preserved; you can say 'continue' to resume."
+                    f"Model request timed out after {eff_timeout:.0f} seconds, three times in a row. Ollama may be "
+                    "loading weights or overloaded. Your progress has been preserved; you can say 'continue' to resume."
                 )
+                if journal:
+                    journal.log("end", status="timeout")
                 self.messages.append({"role": "assistant", "content": err_msg})
                 self.last_turn_status = {
                     "status": "timeout",
@@ -608,6 +820,8 @@ class CoreEngine:
                 }
                 return err_msg
             except Exception as exc:
+                if journal:
+                    journal.log("end", status="error", error=str(exc)[:300])
                 err_msg = f"Inference error: {exc}"
                 self.messages.append({"role": "assistant", "content": err_msg})
                 self.last_turn_status = {
@@ -636,17 +850,44 @@ class CoreEngine:
                         tool_calls.append({"name": tname, "arguments": targs})
 
             if not tool_calls and content:
-                tool_calls = parse_tool_calls(content, registered_names)
+                attempted = parse_tool_calls(content, registered_names)
+                if attempted and getattr(self.client, "supports_structured", False):
+                    # The text only shows that a call was attempted; the call itself comes back schema-constrained.
+                    tool_calls = self._structured_tool_call(ledger.messages(), content, registered_names)
+                else:
+                    tool_calls = attempted       # clients without structured output (simple test doubles)
+
+            # No tool calls: the model thinks it is finished. Check that before ending the turn.
+            unfinished: List[str] = []
+            if not tool_calls and plan is not None:
+                done, problems, _details = tc_ctl.verify(self, effective_user_text, plan, turn_events, content or "",
+                                                         run_test=_run_test)
+                if journal:
+                    journal.log("verify", done=done, problems=problems)
+                if not done and verify_cycles < tc_ctl.MAX_VERIFY_CYCLES and round_idx < round_budget - 1:
+                    verify_cycles += 1
+                    print(f"[Ogun] Not done yet ({len(problems)} check(s) failing); continuing.", flush=True)
+                    ledger.add_assistant(content or "")
+                    ledger.add_user(tc_ctl.not_done_message(problems))
+                    ledger.compact()
+                    continue
+                unfinished = problems
+                if journal:
+                    journal.log("end", status="done" if not problems else "unverified")
 
             # If no tool calls, verify honesty and return visible text
             if not tool_calls:
                 raw_visible = content.strip() if content else "(No response generated)"
+                if unfinished:
+                    raw_visible += ("\n\nNot finished: the automatic checks still report:\n- "
+                                    + "\n- ".join(unfinished[:8]))
                 sanitized, intercepted = sanitize_reply(raw_visible, turn_events, self.base_dir)
-                if intercepted:
+                if intercepted or unfinished:
                     self.last_turn_status = {
                         "status": "failed",
                         "task": user_text if clean_user not in continuation_words else self.last_turn_status.get("task", user_text),
-                        "error": "Model produced unverified claims without tool execution",
+                        "error": ("Automatic checks failing: " + "; ".join(unfinished[:3])) if unfinished
+                        else "Model produced unverified claims without tool execution",
                     }
                 else:
                     self.last_turn_status = {
@@ -657,21 +898,37 @@ class CoreEngine:
                 self.messages.append({"role": "assistant", "content": sanitized})
                 return sanitized
 
-            # Execute tool calls
-            self.messages.append({"role": "assistant", "content": content or ""})
+            # Execute tool calls. The call goes into the context together with its result (live bug: only the
+            # results were kept, so the model saw outputs without knowing which call produced them).
+            ledger.add_assistant(content or "", tool_calls=[{"function": {"name": tc["name"],
+                                                                         "arguments": tc.get("arguments", {})}}
+                                                           for tc in tool_calls])
             for tc in tool_calls:
                 name = tc["name"]
                 args = tc.get("arguments", {})
-                result = self.dispatch_tool(name, args, turn_events=turn_events)
-                self.messages.append(
-                    {
-                        "role": "tool",
-                        "content": str(result),
-                    }
-                )
-
-            # Prune context before next round
-            self.messages = self.context_manager.prune_history(self.messages)
+                # The same call, with nothing changed since it last gave the same result, is a loop: after
+                # REFUSE_AFTER_REPEATS identical results it is not run again until a file changes.
+                call_key = name + json.dumps(args, sort_keys=True, default=str)[:400]
+                writes_now = len(turn_events.files_written)
+                prev = call_state.get(call_key)
+                if prev and prev[1] >= tc_ctl.REFUSE_AFTER_REPEATS and prev[2] == writes_now:
+                    result = (f"Not run: this exact call returned the same result {prev[1]} times and no file changed "
+                              "since. Change the file the error points to before running it again.")
+                else:
+                    result = self.dispatch_tool(name, args, turn_events=turn_events)
+                ledger.add_tool_result(name, args, str(result))
+                if journal:
+                    journal.log("tool", receipt=receipt_for(name, args, str(result)))
+                h = hash(str(result))
+                repeats = prev[1] + 1 if (prev and prev[0] == h and prev[2] == writes_now) else 1
+                call_state[call_key] = (h, repeats, writes_now)
+                if repeats in (2, 4):
+                    open_checks = (tc_ctl.mechanical_problems(self, plan, turn_events, _run_test)[0] if plan else [])
+                    shown = receipt_for(name, args, "")[len("[Tool receipt: "):].split(" -> ")[0]
+                    ledger.add_user(tc_ctl.stall_message(shown, open_checks, tc_ctl.error_lines(str(result))))
+                    if journal:
+                        journal.log("stall", call=name, repeats=repeats, open_checks=open_checks)
+            ledger.compact()
 
         files_str = ", ".join(f"`{p.name}`" for p in turn_events.files_written if p.exists()) if turn_events.files_written else "None"
         last_test = turn_events.tests_executed[-1] if turn_events.tests_executed else None
@@ -679,8 +936,10 @@ class CoreEngine:
         if last_test:
             status = "PASSED" if last_test.get("passed") else "FAILED"
             test_info = f"\n- Last test ({last_test.get('test_path', '')}): {status}\n```text\n{last_test.get('output', '').strip()[:400]}\n```"
+        if journal:
+            journal.log("end", status="round_limit")
         final_msg = (
-            f"Reached maximum tool execution rounds ({max_rounds}).\n\n"
+            f"Reached maximum tool execution rounds ({round_budget}).\n\n"
             f"### Turn Status Summary:\n"
             f"- Files written: {files_str}\n"
             f"- Tests executed: {len(turn_events.tests_executed)}{test_info}\n\n"
@@ -694,6 +953,20 @@ class CoreEngine:
         }
         self.messages.append({"role": "assistant", "content": sanitized})
         return sanitized
+
+
+def _is_cli_project(base_dir: Path, name: str) -> bool:
+    """Is workspace/<name>/<name>.py a command-line program (argparse, sys.argv or a __main__ block)?"""
+    from ogun_core.standalone_builder import WORKSPACE_DIR
+    for root in (Path(base_dir) / "workspace", WORKSPACE_DIR):
+        f = root / name / f"{name}.py"
+        if f.exists():
+            try:
+                src = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return True
+            return any(k in src for k in ("argparse", "sys.argv", "__main__", "click.", "typer."))
+    return True          # unknown: keep the existing routing
 
 
 def unload_model(model: str = MODEL_NAME, host: str = OLLAMA_HOST) -> Dict[str, Any]:
@@ -771,6 +1044,9 @@ def handle_vram_command(text: str, model: str = MODEL_NAME, host: str = OLLAMA_H
     arg = (match.group(1) or "status").strip().lower()
 
     if arg == "free":
+        from ogun_core.kit.gpu_lease import may_unload, unload_blocked_note
+        if not may_unload():
+            return unload_blocked_note()
         result = unload_model(model=model, host=host)
         if result["unloaded"]:
             return "Model unloaded: its GPU memory is free now. The next reply reloads it (about 40 seconds)."

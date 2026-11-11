@@ -138,6 +138,12 @@ def refresh(host: str, model: str, force: bool = False, now: Optional[float] = N
     Only num_gpu changes (num_ctx stays fixed: changing it reloads the model), and only when it moves by at least
     _GPU_CHANGE_MIN_LAYERS or crosses all-on-GPU <-> partial. Returns a short note when it changed. Never raises.
     """
+    try:
+        from ogun_core.kit.gpu_lease import locked as _kit_locked
+        if _kit_locked():
+            return None          # the shared, pinned load options are in charge: no re-tuning, no unload
+    except Exception:  # noqa: BLE001
+        pass
     import time as _time
     try:
         if get_vram_profile() != "AUTO":

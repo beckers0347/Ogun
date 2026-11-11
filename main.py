@@ -78,6 +78,10 @@ def main() -> None:
         def _unload_on_exit() -> None:
             if not _unloaded["done"]:
                 _unloaded["done"] = True
+                from ogun_core.kit.gpu_lease import may_unload, unload_blocked_note
+                if not may_unload():
+                    print(f"[*] {unload_blocked_note()}")
+                    return
                 unload_model(model=args.model)
 
         atexit.register(_unload_on_exit)
