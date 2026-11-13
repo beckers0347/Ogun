@@ -10,3 +10,6 @@
 *.md text eol=lf
 *.json text eol=lf
 *.txt text eol=lf
+
+# Windows Script Host launchers keep CRLF too
+*.vbs text eol=crlf

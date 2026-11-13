@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ogun</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22%3E%3Cdefs%3E%3CradialGradient id=%22g%22 cx=%2230%25%22 cy=%2230%25%22%3E%3Cstop offset=%220%22 stop-color=%22%23ffb27a%22/%3E%3Cstop offset=%22.55%22 stop-color=%22%23ea580c%22/%3E%3Cstop offset=%221%22 stop-color=%22%232a0f05%22/%3E%3C/radialGradient%3E%3C/defs%3E%3Ccircle cx=%2232%22 cy=%2232%22 r=%2230%22 fill=%22url(%23g)%22/%3E%3C/svg%3E">
+<style>
+    :root {
+        --bg: #0b0c10;
+        --panel: #12141a;
+        --panel-2: #171a22;
+        --text: #F3F6FA;
+        --text-dim: #CBD5E1;
+        --text-faint: #8b93a7;
+        --user-bubble: #263349;
+        --ogun-bubble: #1B2433;
+        --border: #283548;
+        --accent: #ff8a3d;
+        --accent-2: #c2410c;
+        --accent-deep: #2a0f05;
+        --accent-glow: 255, 138, 61;
+        --accent-2-glow: 194, 65, 12;
+        --danger: #ef4444;
+        --font-size: 16px;
+        --mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+    }
+    body.theme-teal {
+        --accent: #4ae8c4; --accent-2: #3b5bdb; --accent-deep: #20104a;
+        --accent-glow: 74, 232, 196; --accent-2-glow: 59, 91, 219;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+        background: var(--bg); color: var(--text); font-size: var(--font-size);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        margin: 0; padding: 0; height: 100%; height: 100dvh; overflow: hidden;
+    }
+    body { display: flex; flex-direction: column; }
+    button { font-family: inherit; }
+
+    /* ---------- navbar ---------- */
+    .navbar {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 12px 26px; background: var(--panel); border-bottom: 1px solid var(--border); flex: none;
+    }
+    .brand { display: flex; align-items: baseline; gap: 10px; }
+    .brand h1 { margin: 0; font-size: 1.2rem; font-weight: 600; letter-spacing: .5px; }
+    .brand .ver { color: var(--text-faint); font-size: .78rem; font-family: var(--mono); }
+    .nav-right { display: flex; gap: 10px; align-items: center; }
+    .chip {
+        display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px;
+        background: var(--panel-2); border: 1px solid var(--border); color: var(--text-dim);
+        font-size: .8rem; font-family: var(--mono); max-width: 340px; white-space: nowrap; overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #64748b; flex: none; }
+    .dot.ok { background: #22c55e; box-shadow: 0 0 8px rgba(34,197,94,.6); }
+    .dot.busy { background: var(--accent); box-shadow: 0 0 8px rgba(var(--accent-glow),.8); animation: blink 1s infinite; }
+    .dot.err { background: var(--danger); }
+    @keyframes blink { 50% { opacity: .35; } }
+    .nav-btn {
+        display: flex; align-items: center; gap: 7px; padding: 7px 14px; border-radius: 8px; cursor: pointer;
+        background: transparent; color: var(--text-dim); border: 1px solid var(--border); font-size: .85rem;
+        transition: border-color .15s, color .15s, background .15s;
+    }
+    .nav-btn:hover { color: var(--text); border-color: var(--accent); background: rgba(var(--accent-glow), .06); }
+
+    /* ---------- main ---------- */
+    .main { flex: 1; min-height: 0; display: flex; }
+    .left-col {
+        width: clamp(300px, 27vw, 420px); flex: none; display: flex; flex-direction: column;
+        align-items: center; justify-content: center; padding: 20px; border-right: 1px solid rgba(40,53,72,.45);
+    }
+    .ogun-title { font-size: 1.5rem; font-weight: 300; color: var(--text-dim); letter-spacing: 6px; margin-bottom: 34px; }
+    .orb-container { position: relative; width: 250px; height: 250px; display: flex; justify-content: center; align-items: center; }
+    .orb {
+        width: 176px; height: 176px; border-radius: 50%; position: relative; z-index: 2;
+        background: radial-gradient(circle at 30% 30%, var(--accent), var(--accent-2), var(--accent-deep));
+        box-shadow: 0 0 50px rgba(var(--accent-glow), .35), 0 0 100px rgba(var(--accent-2-glow), .35);
+        animation: pulse 5s infinite ease-in-out alternate;
+    }
+    .orb-ring {
+        position: absolute; width: 212px; height: 212px; border-radius: 50%;
+        border: 2px solid rgba(var(--accent-glow), .1); box-shadow: 0 0 20px rgba(var(--accent-glow), .18) inset;
+        animation: ripple 3.5s infinite linear;
+    }
+    .orb-ring:nth-child(2) { width: 230px; height: 230px; animation-delay: 1.15s; }
+    .orb-ring:nth-child(3) { width: 250px; height: 250px; animation-delay: 2.3s; }
+    body.busy .orb { animation: pulse 1.1s infinite ease-in-out alternate; }
+    body.busy .orb-ring { animation-duration: 1.6s; }
+    body.offline .orb { filter: grayscale(.85) brightness(.6); animation: none; }
+    body.offline .orb-ring { display: none; }
+    @keyframes pulse {
+        0% { transform: scale(.95) rotate(0deg); box-shadow: 0 0 40px rgba(var(--accent-glow),.3), 0 0 80px rgba(var(--accent-2-glow),.3); }
+        100% { transform: scale(1.05) rotate(10deg); box-shadow: 0 0 70px rgba(var(--accent-glow),.6), 0 0 140px rgba(var(--accent-2-glow),.55); }
+    }
+    @keyframes ripple { 0% { transform: scale(.8); opacity: 1; } 100% { transform: scale(1.2); opacity: 0; } }
+
+    .progress-wrapper { display: flex; align-items: center; gap: 12px; margin-top: 26px; opacity: 0; transition: opacity .3s; }
+    body.busy .progress-wrapper { opacity: 1; }
+    .progress-track {
+        width: 200px; height: 8px; background: #12141a; border: 1px solid rgba(var(--accent-glow), .25);
+        border-radius: 6px; overflow: hidden; position: relative; box-shadow: inset 0 1px 3px rgba(0,0,0,.6);
+    }
+    .progress-sweep {
+        position: absolute; top: 0; bottom: 0; width: 38%; border-radius: 5px;
+        background: linear-gradient(90deg, var(--accent-2), var(--accent));
+        box-shadow: 0 0 10px rgba(var(--accent-glow), .5); animation: sweep 1.4s infinite ease-in-out;
+    }
+    @keyframes sweep { 0% { left: -40%; } 100% { left: 102%; } }
+    .elapsed { font-family: var(--mono); font-size: .85rem; font-weight: 600; color: var(--accent); min-width: 54px;
+               text-shadow: 0 0 8px rgba(var(--accent-glow), .4); }
+    .status-text {
+        margin-top: 18px; font-size: .9rem; color: var(--text-dim); font-weight: 300; text-align: center;
+        max-width: 340px; min-height: 2.6em; line-height: 1.35; word-break: break-word;
+    }
+
+    /* ---------- chat ---------- */
+    .chat-col { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 8px clamp(18px, 3vw, 56px) 22px; }
+    .chat-history {
+        flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding: 22px 12px;
+        mask-image: linear-gradient(to bottom, transparent 0%, black 4%, black 96%, transparent 100%);
+        -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 4%, black 96%, transparent 100%);
+        scrollbar-width: thin; scrollbar-color: rgba(var(--accent-glow), .25) transparent;
+    }
+    .msg {
+        padding: 13px 20px; border-radius: 12px; line-height: 1.55; word-break: break-word; white-space: pre-wrap;
+        border: 1px solid var(--border); animation: fadeIn .25s ease;
+    }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+    .msg-user { background: var(--user-bubble); align-self: flex-end; max-width: 80%; border-bottom-right-radius: 4px; }
+    .msg-ogun { background: var(--ogun-bubble); align-self: flex-start; max-width: 96%; border-bottom-left-radius: 4px; }
+    .msg-system { align-self: center; background: transparent; border: none; color: var(--text-faint); font-size: .85rem; padding: 4px; }
+    .msg-error {
+        align-self: flex-start; max-width: 96%; background: rgba(239,68,68,.08); border-color: rgba(239,68,68,.35); color: #fca5a5;
+    }
+    .msg-error button { margin-top: 10px; }
+    .msg pre {
+        white-space: pre; overflow-x: auto; background: #0b0d12; border: 1px solid var(--border); border-radius: 8px;
+        padding: 12px 14px; margin: 8px 0; font-family: var(--mono); font-size: .86em; line-height: 1.45; position: relative;
+    }
+    .msg code { font-family: var(--mono); font-size: .9em; background: rgba(148,163,184,.12); padding: 1px 5px; border-radius: 4px; }
+    .msg pre code { background: none; padding: 0; }
+    .copy-btn {
+        position: absolute; top: 6px; right: 6px; font-size: .72rem; padding: 3px 8px; border-radius: 6px; cursor: pointer;
+        background: var(--panel-2); color: var(--text-dim); border: 1px solid var(--border); opacity: 0; transition: opacity .15s;
+    }
+    .msg pre:hover .copy-btn { opacity: 1; }
+
+    details.activity {
+        align-self: flex-start; max-width: 96%; width: fit-content; min-width: 260px;
+        border: 1px dashed rgba(var(--accent-glow), .28); border-radius: 10px; background: rgba(18,20,26,.6);
+        font-size: .8rem; color: var(--text-faint); animation: fadeIn .25s ease;
+    }
+    details.activity summary {
+        cursor: pointer; padding: 7px 14px; list-style: none; display: flex; gap: 8px; align-items: center;
+        font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70vw;
+    }
+    details.activity summary::-webkit-details-marker { display: none; }
+    details.activity summary::before { content: "\25B8"; color: var(--accent); transition: transform .15s; flex: none; }
+    details.activity[open] summary::before { transform: rotate(90deg); }
+    details.activity .lines {
+        font-family: var(--mono); white-space: pre-wrap; padding: 4px 14px 10px 30px; max-height: 300px; overflow-y: auto;
+        line-height: 1.5; color: var(--text-dim);
+    }
+    details.activity .lines div { border-left: 2px solid rgba(var(--accent-glow), .25); padding-left: 8px; margin: 2px 0; }
+
+    .welcome { margin: auto; text-align: center; color: var(--text-faint); max-width: 560px; line-height: 1.6; }
+    .welcome h2 { color: var(--text-dim); font-weight: 400; margin: 0 0 8px; }
+    .suggestions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 18px; }
+    .suggestion {
+        padding: 8px 14px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel);
+        color: var(--text-dim); cursor: pointer; font-size: .85rem;
+    }
+    .suggestion:hover { border-color: var(--accent); color: var(--text); }
+
+    .chat-form { display: flex; gap: 12px; margin-top: 14px; align-items: flex-end; }
+    .chat-input {
+        flex: 1; resize: none; background: var(--panel); border: 1px solid var(--border); border-radius: 26px;
+        padding: 14px 22px; color: var(--text); font-size: var(--font-size); font-family: inherit; outline: none;
+        box-shadow: 0 4px 12px rgba(0,0,0,.4); max-height: 220px; overflow-y: hidden; line-height: 1.4; transition: border-color .2s, box-shadow .2s;
+    }
+    .chat-input:focus { border-color: var(--accent); box-shadow: 0 4px 20px rgba(var(--accent-glow), .15); }
+    .chat-input:disabled { opacity: .6; }
+    .send-btn {
+        background: var(--accent); color: #000; border: none; border-radius: 50%; width: 50px; height: 50px; min-width: 50px;
+        cursor: pointer; display: flex; justify-content: center; align-items: center; transition: transform .15s, opacity .15s;
+    }
+    .send-btn:hover { transform: scale(1.05); }
+    .send-btn:disabled { opacity: .35; cursor: default; transform: none; }
+    .hint { color: var(--text-faint); font-size: .75rem; margin: 6px 0 0 22px; }
+
+    /* ---------- drawers ---------- */
+    .backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.5); opacity: 0; pointer-events: none; transition: opacity .25s; z-index: 50; }
+    .backdrop.open { opacity: 1; pointer-events: auto; }
+    .drawer {
+        position: fixed; top: 0; right: 0; bottom: 0; width: min(460px, 92vw); background: var(--panel);
+        border-left: 1px solid var(--border); transform: translateX(100%); transition: transform .3s cubic-bezier(.25,1,.5,1);
+        z-index: 60; display: flex; flex-direction: column; box-shadow: -10px 0 40px rgba(0,0,0,.5);
+    }
+    .drawer.open { transform: none; }
+    .drawer-header { display: flex; justify-content: space-between; align-items: center; padding: 18px 22px; border-bottom: 1px solid var(--border); }
+    .drawer-header h2 { margin: 0; font-size: 1.05rem; font-weight: 600; }
+    .icon-btn { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 1.1rem; padding: 4px 8px; border-radius: 6px; }
+    .icon-btn:hover { color: var(--text); background: var(--panel-2); }
+    .drawer-body { flex: 1; overflow-y: auto; padding: 18px 22px 30px; }
+    .section { margin-bottom: 26px; }
+    .section h3 { font-size: .75rem; text-transform: uppercase; letter-spacing: 1.2px; color: var(--text-faint); margin: 0 0 10px; font-weight: 600; }
+    .kv { display: grid; grid-template-columns: 110px 1fr; gap: 6px 10px; font-size: .88rem; }
+    .kv span:nth-child(odd) { color: var(--text-faint); }
+    .kv span:nth-child(even) { font-family: var(--mono); word-break: break-all; }
+    .btn-row { display: flex; flex-wrap: wrap; gap: 8px; }
+    .btn {
+        padding: 8px 14px; border-radius: 8px; cursor: pointer; border: 1px solid var(--border); background: var(--panel-2);
+        color: var(--text); font-size: .85rem; transition: border-color .15s, background .15s;
+    }
+    .btn:hover { border-color: var(--accent); }
+    .btn.primary { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 600; }
+    .btn.danger { color: #fca5a5; border-color: rgba(239,68,68,.45); }
+    .btn.danger:hover { background: rgba(239,68,68,.12); border-color: var(--danger); }
+    .btn:disabled { opacity: .45; cursor: default; }
+    .note-box {
+        margin-top: 10px; font-size: .84rem; color: var(--text-dim); background: #0b0d12; border: 1px solid var(--border);
+        border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; display: none; line-height: 1.45;
+    }
+    .note-box.show { display: block; }
+    .field-help { font-size: .8rem; color: var(--text-faint); margin: 6px 0 10px; line-height: 1.45; }
+    textarea.field {
+        width: 100%; min-height: 90px; resize: vertical; background: #0b0d12; color: var(--text); border: 1px solid var(--border);
+        border-radius: 8px; padding: 10px 12px; font-family: inherit; font-size: .9rem; outline: none;
+    }
+    textarea.field:focus { border-color: var(--accent); }
+    .plugin-card { border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; margin-bottom: 8px; background: var(--panel-2); }
+    .plugin-card .name { font-family: var(--mono); font-size: .88rem; color: var(--accent); }
+    .plugin-card .desc { font-size: .84rem; color: var(--text-dim); margin-top: 4px; line-height: 1.4; }
+    .plugin-card .params { font-size: .75rem; color: var(--text-faint); margin-top: 6px; font-family: var(--mono); }
+    .empty { color: var(--text-faint); font-size: .88rem; }
+    .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    .seg button { background: var(--panel-2); color: var(--text-dim); border: none; padding: 7px 14px; cursor: pointer; font-size: .85rem; }
+    .seg button.on { background: var(--accent); color: #000; font-weight: 600; }
+    input[type=range] { width: 100%; accent-color: var(--accent); }
+
+    /* ---------- closed overlay ---------- */
+    .closed-overlay {
+        position: fixed; inset: 0; background: rgba(11,12,16,.94); display: none; z-index: 100;
+        align-items: center; justify-content: center; flex-direction: column; gap: 10px; text-align: center;
+    }
+    .closed-overlay.show { display: flex; }
+    .closed-overlay h2 { font-weight: 300; letter-spacing: 3px; color: var(--text-dim); margin: 0; }
+    .closed-overlay p { color: var(--text-faint); margin: 0; }
+</style>
+</head>
+<body class="offline">
+<div class="navbar">
+    <div class="brand"><h1>Ogun</h1><span class="ver" id="version"></span></div>
+    <div class="nav-right">
+        <div class="chip" id="statusChip" title="Model and connection"><span class="dot" id="statusDot"></span><span id="chipText">Starting...</span></div>
+        <button class="nav-btn" id="pluginsBtn" title="Installed plugins and plugin builds">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v6M8 4v4M16 4v4M6 8h12v4a6 6 0 0 1-12 0V8zM12 18v4"/></svg>
+            Plugins
+        </button>
+        <button class="nav-btn" id="settingsBtn" title="Settings">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            Settings
+        </button>
+    </div>
+</div>
+
+<div class="main">
+    <div class="left-col">
+        <div class="ogun-title">OGUN</div>
+        <div class="orb-container" title="Ogun's status">
+            <div class="orb-ring"></div><div class="orb-ring"></div><div class="orb-ring"></div>
+            <div class="orb"></div>
+        </div>
+        <div class="progress-wrapper">
+            <div class="progress-track"><div class="progress-sweep"></div></div>
+            <div class="elapsed" id="elapsed">0s</div>
+        </div>
+        <div class="status-text" id="statusText">Starting...</div>
+    </div>
+
+    <div class="chat-col">
+        <div class="chat-history" id="history">
+            <div class="welcome" id="welcome">
+                <h2>What should Ogun build?</h2>
+                Ogun writes, runs and fixes code in its workspace, and builds plugins it can use later.
+                Everything runs on this machine.
+                <div class="suggestions">
+                    <button class="suggestion" data-text="Create workspace/hello/hello.py with a function greet(name) and a unittest, and make sure the test passes">Write a module with a test</button>
+                    <button class="suggestion" data-text="Build a plugin that converts Celsius to Fahrenheit">Build a plugin</button>
+                    <button class="suggestion" data-text="/vram status">GPU status</button>
+                </div>
+            </div>
+        </div>
+        <form class="chat-form" id="chatForm">
+            <textarea id="chatInput" class="chat-input" rows="1" placeholder="Ask Ogun to write, fix or build something..." autocomplete="off"></textarea>
+            <button type="submit" class="send-btn" id="sendBtn" title="Send (Enter)">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+            </button>
+        </form>
+        <div class="hint" id="hint">Enter sends &middot; Shift+Enter for a new line</div>
+    </div>
+</div>
+
+<div class="backdrop" id="backdrop"></div>
+
+<div class="drawer" id="pluginsDrawer" role="dialog" aria-label="Plugins">
+    <div class="drawer-header"><h2>Plugins</h2><button class="icon-btn" data-close title="Close (Esc)">&#x2715;</button></div>
+    <div class="drawer-body">
+        <div class="section">
+            <h3>Build a new plugin</h3>
+            <textarea class="field" id="buildInput" placeholder="e.g. a plugin that counts the words in a text file"></textarea>
+            <div class="field-help">Ogun writes the plugin and a test, then fixes it until the test passes, and installs it.</div>
+            <button class="btn primary" id="buildBtn">Build plugin</button>
+        </div>
+        <div class="section">
+            <h3 style="display:flex;justify-content:space-between;align-items:center">Installed <button class="btn" id="reloadPluginsBtn" style="padding:4px 10px;font-size:.75rem">Reload</button></h3>
+            <div id="pluginList"><div class="empty">Loading...</div></div>
+        </div>
+    </div>
+</div>
+
+<div class="drawer" id="settingsDrawer" role="dialog" aria-label="Settings">
+    <div class="drawer-header"><h2>Settings</h2><button class="icon-btn" data-close title="Close (Esc)">&#x2715;</button></div>
+    <div class="drawer-body">
+        <div class="section">
+            <h3>Ogun</h3>
+            <div class="kv">
+                <span>Model</span><span id="setModel">-</span>
+                <span>Version</span><span id="setVersion">-</span>
+                <span>Status</span><span id="setStatus">-</span>
+            </div>
+        </div>
+        <div class="section">
+            <h3>GPU memory</h3>
+            <div class="btn-row">
+                <button class="btn" data-vram="status">Status</button>
+                <button class="btn" data-vram="auto">Auto</button>
+                <button class="btn" data-vram="max">Max (fastest)</button>
+                <button class="btn" data-vram="shared">Shared</button>
+                <button class="btn" data-vram="cpu">CPU only</button>
+                <button class="btn danger" data-vram="free">Free GPU memory</button>
+            </div>
+            <div class="field-help">Shared leaves room for Unreal or Blender. Free unloads the model now; the next message reloads it.</div>
+            <div class="note-box" id="vramNote"></div>
+        </div>
+        <div class="section">
+            <h3>Appearance</h3>
+            <div class="field-help" style="margin-top:0">Color</div>
+            <div class="seg" id="themeSeg"><button data-theme="ember">Ember</button><button data-theme="teal">Teal</button></div>
+            <div class="field-help">Text size: <span id="fontVal">16</span>px</div>
+            <input type="range" id="fontRange" min="13" max="22" step="1">
+        </div>
+        <div class="section">
+            <h3>Session</h3>
+            <div class="btn-row">
+                <button class="btn" id="clearBtn">Clear chat view</button>
+                <button class="btn danger" id="quitBtn">Quit Ogun</button>
+            </div>
+            <div class="field-help">Closing this window also quits Ogun and frees the GPU. A task that is running finishes first.</div>
+        </div>
+    </div>
+</div>
+
+<div class="closed-overlay" id="closedOverlay">
+    <h2>OGUN HAS CLOSED</h2>
+    <p id="closedText">You can close this window.</p>
+</div>
+
+<script>
+(() => {
+    "use strict";
+    // ---- token: passed once in the URL fragment (never sent over the network in a URL), then kept for this window ----
+    const m = location.hash.match(/t=([A-Za-z0-9_\-]+)/);
+    if (m) { sessionStorage.setItem("ogunToken", m[1]); history.replaceState(null, "", location.pathname); }
+    const TOKEN = sessionStorage.getItem("ogunToken") || "";
+
+    const $ = (id) => document.getElementById(id);
+    const history_ = $("history"), input = $("chatInput"), sendBtn = $("sendBtn");
+    let lastId = 0, state = { busy: false, ready: false }, failures = 0, closed = false, quitting = false;
+    let activityBox = null;     // the activity block of the current job
+
+    async function api(path, body) {
+        const opts = { method: body === undefined ? "GET" : "POST", headers: { "X-Ogun-Token": TOKEN } };
+        if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+        const r = await fetch(path, opts);
+        let data = {};
+        try { data = await r.json(); } catch (e) {}
+        if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+        return data;
+    }
+
+    // ---- rendering ----
+    function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+    function inline(s) {
+        return esc(s).replace(/`([^`\n]+)`/g, "<code>$1</code>").replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    }
+    function renderText(text) {
+        const parts = String(text).split(/```[^\n]*\n?/);
+        return parts.map((p, i) => i % 2
+            ? '<pre><button class="copy-btn" type="button">Copy</button><code>' + esc(p.replace(/\n$/, "")) + "</code></pre>"
+            : inline(p)).join("");
+    }
+    function nearBottom() { return history_.scrollHeight - history_.scrollTop - history_.clientHeight < 140; }
+    function scrollDown(force) { if (force || nearBottom()) requestAnimationFrame(() => history_.scrollTop = history_.scrollHeight); }
+    function hideWelcome() { const w = $("welcome"); if (w) w.remove(); }
+
+    function place(el) {
+        const w = $("welcome");
+        if (w) history_.insertBefore(el, w); else history_.appendChild(el);
+    }
+    function addMsg(cls, html) {
+        if (cls !== "msg-system") hideWelcome();
+        const stick = nearBottom();
+        const d = document.createElement("div");
+        d.className = "msg " + cls;
+        d.innerHTML = html;
+        place(d);
+        scrollDown(stick);
+        return d;
+    }
+    function newActivity(label) {
+        const d = document.createElement("details");
+        d.className = "activity";
+        d.innerHTML = '<summary></summary><div class="lines"></div>';
+        d.querySelector("summary").textContent = label;
+        place(d);
+        return d;
+    }
+    function addActivity(text) {
+        const stick = nearBottom();
+        if (!activityBox) activityBox = newActivity(state.ready ? "Activity" : "Starting up");
+        const line = document.createElement("div");
+        line.textContent = text;
+        const lines = activityBox.querySelector(".lines");
+        lines.appendChild(line);
+        lines.scrollTop = lines.scrollHeight;
+        const n = lines.children.length;
+        const label = state.ready || state.busy && state.job !== "startup" ? text.split("\n")[0].trim().slice(0, 160) : "Starting up";
+        activityBox.querySelector("summary").textContent = label + (n > 1 ? `  (${n} steps)` : "");
+        scrollDown(stick);
+    }
+
+    function handleEvent(ev) {
+        if (ev.kind === "user") {
+            hideWelcome();
+            addMsg("msg-user", esc(ev.text));
+            activityBox = null;
+        } else if (ev.kind === "activity") {
+            addActivity(ev.text);
+        } else if (ev.kind === "assistant") {
+            if (activityBox) {
+                const n = activityBox.querySelector(".lines").children.length;
+                activityBox.querySelector("summary").textContent = `Worked through ${n} step${n === 1 ? "" : "s"}`;
+            }
+            activityBox = null;
+            addMsg("msg-ogun", renderText(ev.text));
+        } else if (ev.kind === "system") {
+            if (activityBox) {
+                const n = activityBox.querySelector(".lines").children.length;
+                activityBox.querySelector("summary").textContent = `Started up (${n} step${n === 1 ? "" : "s"})`;
+            }
+            activityBox = null;
+            addMsg("msg-system", esc(ev.text));
+        } else if (ev.kind === "error") {
+            activityBox = null;
+            const d = addMsg("msg-error", esc(ev.text));
+            if (!state.ready) {
+                const b = document.createElement("button");
+                b.className = "btn"; b.textContent = "Try again";
+                b.onclick = async () => { b.disabled = true; try { await api("/api/retry", {}); } catch (e) {} };
+                d.appendChild(document.createElement("br")); d.appendChild(b);
+            }
+        }
+    }
+
+    function applyState(s) {
+        state = s;
+        document.body.classList.toggle("busy", !!s.busy);
+        document.body.classList.toggle("offline", !s.ready);
+        const dot = $("statusDot");
+        dot.className = "dot " + (s.busy ? "busy" : s.ready ? "ok" : s.error ? "err" : "");
+        $("chipText").textContent = s.ready ? (s.model + (s.busy ? " · working" : " · ready")) : (s.error ? "Not connected" : "Starting...");
+        $("version").textContent = s.version ? "v" + s.version : "";
+        let status = s.busy ? s.status : (s.ready ? "Ready. Type a message to start." : (s.error ? "Could not start: " + s.error : s.status));
+        if (quitting && s.busy) status = "Quitting after this task finishes... " + status;
+        $("statusText").textContent = status;
+        $("elapsed").textContent = fmtTime(s.elapsed || 0);
+        $("setModel").textContent = s.model || "-";
+        $("setVersion").textContent = s.version || "-";
+        $("setStatus").textContent = s.busy ? "working" : s.ready ? "ready" : (s.error ? "not connected" : "starting");
+        const canSend = s.ready && !s.busy;
+        sendBtn.disabled = !canSend || !input.value.trim();
+        $("buildBtn").disabled = !canSend;
+        input.placeholder = s.busy ? "Ogun is working... you can type your next message" :
+            s.ready ? "Ask Ogun to write, fix or build something..." : "Waiting for Ogun to start...";
+    }
+    function fmtTime(sec) { sec = Math.floor(sec); return sec < 60 ? sec + "s" : Math.floor(sec / 60) + "m " + String(sec % 60).padStart(2, "0") + "s"; }
+
+    // ---- polling (also the heartbeat that keeps Ogun running) ----
+    async function poll() {
+        if (closed) return;
+        try {
+            const s = await api("/api/state?after=" + lastId);
+            failures = 0;
+            for (const ev of s.events) { handleEvent(ev); lastId = Math.max(lastId, ev.id); }
+            applyState(s);
+        } catch (e) {
+            failures++;
+            if (failures >= 4) return showClosed(quitting ? "You can close this window." :
+                "Ogun stopped responding. Start it again from Ogun.vbs.");
+        }
+        setTimeout(poll, state.busy ? 600 : 1200);
+    }
+    function showClosed(text) {
+        closed = true;
+        $("closedText").textContent = text;
+        $("closedOverlay").classList.add("show");
+        setTimeout(() => window.close(), 1500);
+    }
+
+    // ---- chat ----
+    function autosize() {
+        input.style.height = "auto";
+        const h = input.scrollHeight + 2;
+        input.style.height = Math.min(h, 220) + "px";
+        input.style.overflowY = h > 220 ? "auto" : "hidden";
+    }
+    input.addEventListener("input", () => { autosize(); sendBtn.disabled = !(state.ready && !state.busy && input.value.trim()); });
+    input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("chatForm").requestSubmit(); }
+    });
+    $("chatForm").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const text = input.value.trim();
+        if (!text || !state.ready || state.busy) return;
+        sendBtn.disabled = true;
+        try {
+            await api("/api/chat", { text });
+            input.value = ""; autosize();
+            state.busy = true; scrollDown(true);
+        } catch (err) {
+            addMsg("msg-error", esc(err.message));
+        }
+    });
+    document.querySelectorAll(".suggestion").forEach(b => b.addEventListener("click", () => {
+        input.value = b.dataset.text; autosize(); input.focus();
+        sendBtn.disabled = !(state.ready && !state.busy);
+    }));
+    history_.addEventListener("click", (e) => {
+        if (!e.target.classList.contains("copy-btn")) return;
+        const code = e.target.parentElement.querySelector("code").innerText;
+        navigator.clipboard.writeText(code).then(() => { e.target.textContent = "Copied"; setTimeout(() => e.target.textContent = "Copy", 1200); });
+    });
+
+    // ---- drawers ----
+    function openDrawer(id) {
+        closeDrawers();
+        $(id).classList.add("open"); $("backdrop").classList.add("open");
+        if (id === "pluginsDrawer") loadPlugins();
+    }
+    function closeDrawers() {
+        document.querySelectorAll(".drawer.open").forEach(d => d.classList.remove("open"));
+        $("backdrop").classList.remove("open");
+    }
+    $("pluginsBtn").onclick = () => openDrawer("pluginsDrawer");
+    $("settingsBtn").onclick = () => openDrawer("settingsDrawer");
+    $("backdrop").onclick = closeDrawers;
+    document.querySelectorAll("[data-close]").forEach(b => b.onclick = closeDrawers);
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawers(); });
+
+    // plugins
+    function renderPlugins(list) {
+        const box = $("pluginList");
+        if (!list.length) { box.innerHTML = '<div class="empty">No plugins yet. Build one above, or ask for one in the chat.</div>'; return; }
+        box.innerHTML = list.map(p => `<div class="plugin-card"><div class="name">${esc(p.name)}</div>` +
+            (p.description ? `<div class="desc">${esc(p.description)}</div>` : "") +
+            (p.parameters.length ? `<div class="params">parameters: ${p.parameters.map(esc).join(", ")}</div>` : "") + "</div>").join("");
+    }
+    async function loadPlugins() {
+        try { renderPlugins((await api("/api/plugins")).plugins); } catch (e) { $("pluginList").innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; }
+    }
+    $("reloadPluginsBtn").onclick = async () => { try { renderPlugins((await api("/api/plugins/reload", {})).plugins); } catch (e) {} };
+    $("buildBtn").onclick = async () => {
+        const request = $("buildInput").value.trim();
+        if (!request) { $("buildInput").focus(); return; }
+        try { await api("/api/build", { request }); $("buildInput").value = ""; closeDrawers(); state.busy = true; }
+        catch (e) { addMsg("msg-error", esc(e.message)); closeDrawers(); }
+    };
+
+    // settings
+    document.querySelectorAll("[data-vram]").forEach(b => b.onclick = async () => {
+        const note = $("vramNote");
+        note.classList.add("show"); note.textContent = "Working...";
+        document.querySelectorAll("[data-vram]").forEach(x => x.disabled = true);
+        try { note.textContent = (await api("/api/vram", { arg: b.dataset.vram })).reply; }
+        catch (e) { note.textContent = e.message; }
+        document.querySelectorAll("[data-vram]").forEach(x => x.disabled = false);
+    });
+    function setTheme(t) {
+        document.body.classList.toggle("theme-teal", t === "teal");
+        localStorage.setItem("ogunTheme", t);
+        document.querySelectorAll("#themeSeg button").forEach(b => b.classList.toggle("on", b.dataset.theme === t));
+    }
+    document.querySelectorAll("#themeSeg button").forEach(b => b.onclick = () => setTheme(b.dataset.theme));
+    setTheme(localStorage.getItem("ogunTheme") || "ember");
+    function setFont(px) {
+        document.documentElement.style.setProperty("--font-size", px + "px");
+        $("fontVal").textContent = px; $("fontRange").value = px; localStorage.setItem("ogunFont", px);
+    }
+    $("fontRange").oninput = (e) => setFont(e.target.value);
+    setFont(localStorage.getItem("ogunFont") || 16);
+    $("clearBtn").onclick = () => { history_.innerHTML = ""; activityBox = null; closeDrawers(); };
+    $("quitBtn").onclick = async () => {
+        if (state.busy && !confirm("Ogun is working on a task. Quit when it finishes?")) return;
+        quitting = true; closeDrawers();
+        try { await api("/api/quit", {}); } catch (e) {}
+        if (!state.busy) showClosed("You can close this window.");
+    };
+
+    // closing the window: tell Ogun right away (the heartbeat timeout is only the fallback)
+    window.addEventListener("pagehide", () => {
+        try { navigator.sendBeacon("/api/bye", new Blob([JSON.stringify({ token: TOKEN })], { type: "text/plain" })); } catch (e) {}
+    });
+
+    autosize();
+    poll();
+    input.focus();
+})();
+</script>
+</body>
+</html>

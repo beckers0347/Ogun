@@ -33,10 +33,12 @@ git clone https://github.com/beckers0347/Ogun.git
 cd Ogun
 
 :: 3. Run it (the first run creates .venv and installs the one dependency)
-run_ogun.bat
+Ogun.vbs             :: in its own window, no terminal (double-click it in Explorer)
+run_ogun.bat         :: or the terminal chat
 ```
 
-You should see a banner and a `Ogun >` prompt. Ask something, or try `/vram status`. The **first reply after starting is slow** (30-40 seconds) because Ollama has to load the model into memory; later replies are fast.
+`Ogun.vbs` opens Ogun's desktop window (see [Desktop window](#desktop-window)). Its first start sets up `.venv` with no
+console showing, so give it a minute. In the terminal you should see a banner and a `Ogun >` prompt. Ask something, or try `/vram status`. The **first reply after starting is slow** (30-40 seconds) because Ollama has to load the model into memory; later replies are fast.
 
 If Ollama isn't running, Ogun tells you in plain English and exits.
 
@@ -44,7 +46,33 @@ If Ollama isn't running, Ogun tells you in plain English and exits.
 
 ## Using Ogun
 
-### Interactive chat
+### Desktop window
+
+Double-click **`Ogun.vbs`** (or run `run_ogun.bat --ui`). Ogun opens in its own app window, and no terminal is shown;
+everything is done from the window:
+
+- **Chat.** Enter sends, Shift+Enter starts a new line. While Ogun works, the orb pulses and the status line shows the
+  current step. Each reply has a collapsible **activity** box listing every tool call and builder step. Code blocks
+  have a Copy button.
+- **Plugins.** Lists the installed plugins. *Build plugin* writes, tests and installs a new one; this is the same as
+  `--build-plugin`.
+- **Settings.**
+  - GPU memory: the same actions as `/vram`, which still works in the chat.
+  - The model and version in use.
+  - Text size and color.
+  - Quit.
+
+How it runs:
+- The window is a small page served only on `127.0.0.1` (port 5010, or `OGUN_UI_PORT`), and shown in an Edge or
+  Chrome app window. If neither is installed, it opens in your default browser.
+- Each launch makes a random key that only that window knows, so other web pages can't send Ogun commands.
+- **Closing the window quits Ogun** and frees the GPU. If a task is running, it finishes first, so no file is left
+  half written.
+- Starting Ogun again while it's open just brings up another window on the same session.
+- With no terminal, output goes to `%LOCALAPPDATA%\Ogun\ogun.log`. If Ogun can't reach Ollama, the window says so and
+  offers *Try again*.
+
+### Interactive chat (terminal)
 
 ```bat
 run_ogun.bat
@@ -56,6 +84,7 @@ Type a request and press Enter. Type `exit` or `quit` to leave. `Ctrl+C` cancels
 
 | Option | What it does |
 |---|---|
+| `--ui` | open the desktop window instead of the terminal chat (`Ogun.vbs` does this without a console) |
 | `--once "prompt"` | run a single turn, print the answer, exit |
 | `--build-plugin "description"` | have the model write, test and mount a plugin (see below) |
 | `--model NAME` | use another Ollama model (default `qwen2.5-coder:14b`) |
@@ -305,9 +334,10 @@ py -3.12 tests\run_all.py
 
 ```
 Ogun/
-├── run_ogun.bat            launcher: chat + code engine
+├── Ogun.vbs                 launcher: desktop window, no console
+├── run_ogun.bat            launcher: chat + code engine (--ui for the window)
 ├── test_plugin_builder.bat  launcher: end-to-end plugin builder test
-├── main.py                  CLI entry point and chat loop
+├── main.py                  entry point: window (--ui) or terminal chat
 ├── requirements.txt         runtime dependencies (ollama)
 ├── test_harness.py          the plugin-builder test
 ├── ogun_core/              engine
@@ -320,6 +350,7 @@ Ogun/
 │   ├── plugin_manager.py    validate, test, hot-load, registry, quarantine
 │   ├── security.py          path guard
 │   ├── base_tool.py         BaseTool and ToolResult
+│   ├── ui/                  desktop window: local server (server.py) and page (index.html)
 │   └── paths.py             location-independent paths
 ├── plugins/                 custom_tools/, tests/, registry.json
 ├── workspace/               scratch area the AI may write to

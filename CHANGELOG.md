@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Desktop window: `Ogun.vbs` (or `--ui`) runs Ogun in its own app window with no terminal: chat with live tool activity, plugin list and builds, GPU controls, and Quit. Closing the window quits Ogun after any running task finishes.
 - Builds have no attempt limit: plugin builds, tool builds and tool updates retry until they pass. `Ctrl+C` stops one; `OGUN_BUILD_MAX_ATTEMPTS` caps them.
 - Failure research: on repeated failures the model writes a root-cause diagnosis before the next fix. Optional web search for the error (`OGUN_WEB_RESEARCH=1`, off by default).
 - After five identical failures a build starts over from scratch.
